@@ -63,15 +63,19 @@ struct ToolDef {
     /// GitHub release asset filename template, e.g. `"koyeb-cli_{VERSION}_windows_amd64.zip"`.
     asset_template: String,
 
-    /// Path of the entry *inside* the zip that should be extracted, e.g. `"koyeb.exe"` or
-    /// `"cli_v{VERSION}.exe"`.
+    /// Path of the entry *inside* the archive that should be extracted, e.g. `"koyeb.exe"` or
+    /// `"cli_{VERSION}.exe"`.
     /// If not specified, the asset itself is assumed to be a raw executable file.
     #[serde(default)]
-    zip_entry_template: Option<String>,
+    archive_entry_template: Option<String>,
 }
 
 fn get_os() -> &'static str {
-    std::env::consts::OS
+    if std::env::consts::OS == "macos" {
+        "darwin"
+    } else {
+        std::env::consts::OS
+    }
 }
 
 fn get_arch() -> &'static str {
@@ -86,12 +90,21 @@ fn get_exe_suffix() -> &'static str {
     if cfg!(windows) { ".exe" } else { "" }
 }
 
+fn get_archive_ext() -> &'static str {
+    if cfg!(windows) {
+        "zip"
+    } else {
+        "tar.gz"
+    }
+}
+
 fn expand_template(template: &str, version: &str) -> String {
     template
         .replace("{VERSION}", version)
         .replace("{OS}", get_os())
         .replace("{ARCH}", get_arch())
         .replace("{EXE}", get_exe_suffix())
+        .replace("{EXT}", get_archive_ext())
 }
 
 impl ToolDef {
@@ -99,8 +112,8 @@ impl ToolDef {
         expand_template(&self.asset_template, version)
     }
 
-    fn zip_entry(&self, version: &str) -> Option<String> {
-        self.zip_entry_template
+    fn archive_entry(&self, version: &str) -> Option<String> {
+        self.archive_entry_template
             .as_ref()
             .map(|t| expand_template(t, version))
     }
@@ -267,6 +280,28 @@ fn extract_entry(zip_bytes: &[u8], entry_name: &str, dest: &Path) -> Result<()> 
     Ok(())
 }
 
+fn extract_tar_gz(tar_gz_bytes: &[u8], entry_name: &str, dest: &Path) -> Result<()> {
+    let cursor = io::Cursor::new(tar_gz_bytes);
+    let tar = flate2::read::GzDecoder::new(cursor);
+    let mut archive = tar::Archive::new(tar);
+
+    for file in archive.entries().context("reading tar entries")? {
+        let mut file = file.context("reading tar entry")?;
+        let path = file.path().context("reading tar entry path")?;
+
+        let fname = path.to_string_lossy().replace('\\', "/");
+        let basename = fname.split('/').next_back().unwrap_or(&fname);
+
+        if basename.eq_ignore_ascii_case(entry_name) || fname.eq_ignore_ascii_case(entry_name) {
+            let mut out =
+                fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+            io::copy(&mut file, &mut out).context("writing extracted file")?;
+            return Ok(());
+        }
+    }
+    bail!("'{}' not found in tar.gz", entry_name);
+}
+
 // ── Per-tool update flow ─────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -342,10 +377,17 @@ fn process_tool_impl(
 
     // ── Extract or direct-write ───────────────────────────────────────────────
     let tmp_path = install_dir.join(format!("{}.tmp", expand_template(&tool.exe_name, "")));
-    match tool.zip_entry(&latest_str) {
-        Some(zip_entry) => {
-            extract_entry(&asset_bytes, &zip_entry, &tmp_path)
-                .with_context(|| format!("extracting '{}' from zip", zip_entry))?;
+    match tool.archive_entry(&latest_str) {
+        Some(archive_entry) => {
+            if url.ends_with(".zip") {
+                extract_entry(&asset_bytes, &archive_entry, &tmp_path)
+                    .with_context(|| format!("extracting '{}' from zip", archive_entry))?;
+            } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
+                extract_tar_gz(&asset_bytes, &archive_entry, &tmp_path)
+                    .with_context(|| format!("extracting '{}' from tar.gz", archive_entry))?;
+            } else {
+                bail!("unsupported archive format for URL: {}", url);
+            }
         }
         None => {
             // Asset is a raw executable — write it directly.
@@ -400,8 +442,8 @@ fn perform_self_update(
         version_args: vec![],
         version_regex: "".to_string(),
         repo: repo.to_string(),
-        asset_template: "clipdate_{VERSION}_{OS}_{ARCH}.zip".to_string(),
-        zip_entry_template: Some(format!("clipdate{}", exe_suffix)),
+        asset_template: "clipdate_{VERSION}_{OS}_{ARCH}.{EXT}".to_string(),
+        archive_entry_template: Some(format!("clipdate{}", exe_suffix)),
     };
 
     let exe_path = std::env::current_exe().unwrap_or_else(|_| install_dir.join(&tool.exe_name));
@@ -448,10 +490,13 @@ fn build_client(token: Option<&str>) -> Result<reqwest::blocking::Client> {
     use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
 
     let mut headers = HeaderMap::new();
-    // from_static is infallible and avoids a heap allocation for compile-time strings.
+
+    let repo = option_env!("CLIPDATE_REPO").unwrap_or("Noob-Lol/clipdate");
+    let user_agent = format!("clipdate/{} (https://github.com/{})", env!("CARGO_PKG_VERSION"), repo);
+    
     headers.insert(
         USER_AGENT,
-        HeaderValue::from_static("clipdate/0.1 (https://github.com/Noob-Lol/clipdate)"),
+        user_agent.parse().unwrap_or(HeaderValue::from_static("clipdate")),
     );
     headers.insert(
         ACCEPT,
@@ -640,4 +685,76 @@ fn main() -> Result<()> {
         bail!("{} tool(s) failed to update", errors);
     }
     Ok(())
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expand_template() {
+        // We can't strictly assert OS/ARCH because they vary by the machine running the test,
+        // but we can assert {VERSION} and that the placeholders are no longer present.
+        let expanded = expand_template("test_{VERSION}_{OS}_{ARCH}_{EXE}_{EXT}", "1.2.3");
+        assert!(expanded.contains("1.2.3"));
+        assert!(!expanded.contains("{VERSION}"));
+        assert!(!expanded.contains("{OS}"));
+        assert!(!expanded.contains("{ARCH}"));
+        assert!(!expanded.contains("{EXE}"));
+        assert!(!expanded.contains("{EXT}"));
+
+        // If we are on windows, check specific values.
+        if cfg!(windows) {
+            assert!(expanded.contains("zip"));
+            assert!(expanded.contains(".exe"));
+        } else {
+            assert!(expanded.contains("tar.gz"));
+        }
+    }
+
+    #[test]
+    fn test_parse_version() {
+        let re = Regex::new(r"(\d+\.\d+\.\d+)").unwrap();
+        
+        // Simple case
+        let v = parse_version("v1.2.3", &re).unwrap();
+        assert_eq!(v, Version::parse("1.2.3").unwrap());
+
+        // Complex CLI output
+        let out = "cli version 10.5.1-beta (commit 12345)";
+        let v = parse_version(out, &re).unwrap();
+        assert_eq!(v, Version::parse("10.5.1").unwrap());
+
+        // Error case
+        assert!(parse_version("no version here", &re).is_err());
+    }
+
+    #[test]
+    fn test_archive_entry_deserialization() {
+        // Test that JSON successfully parses into ToolDef.
+        let json = r#"{
+            "name": "foo",
+            "exe_name": "foo.exe",
+            "version_args": ["-v"],
+            "version_regex": "(.*)",
+            "repo": "foo/bar",
+            "asset_template": "foo.zip",
+            "archive_entry_template": "bin/foo.exe"
+        }"#;
+        let tool: ToolDef = serde_json::from_str(json).unwrap();
+        assert_eq!(tool.archive_entry_template.as_deref(), Some("bin/foo.exe"));
+        
+        let no_entry_json = r#"{
+            "name": "foo",
+            "exe_name": "foo.exe",
+            "version_args": ["-v"],
+            "version_regex": "(.*)",
+            "repo": "foo/bar",
+            "asset_template": "foo.zip"
+        }"#;
+        let tool2: ToolDef = serde_json::from_str(no_entry_json).unwrap();
+        assert_eq!(tool2.archive_entry_template, None);
+    }
 }
