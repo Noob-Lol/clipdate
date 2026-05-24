@@ -1,20 +1,28 @@
 [
   {
     "name": "koyeb",
-    "exe_name": "koyeb.exe",
+    "exe_name": "koyeb{EXE}",
     "version_args": ["version"],
     "version_regex": "(\\d+\\.\\d+\\.\\d+)",
     "repo": "koyeb/koyeb-cli",
-    "asset_template": "koyeb-cli_{VERSION}_windows_amd64.zip",
-    "zip_entry_template": "koyeb.exe"
+    "asset_template": "koyeb-cli_{VERSION}_{OS}_{ARCH}.{EXT}",
+    "archive_entry_template": "koyeb{EXE}"
   },
   {
     "name": "render",
-    "exe_name": "render.exe",
+    "exe_name": "render{EXE}",
     "version_args": ["--version"],
     "version_regex": "(\\d+\\.\\d+\\.\\d+)",
     "repo": "render-oss/cli",
-    "asset_template": "cli_{VERSION}_windows_amd64.zip",
-    "zip_entry_template": "cli_v{VERSION}.exe"
+    "asset_template": "cli_{VERSION}_{OS}_{ARCH}.{EXT}",
+    "archive_entry_template": "cli_v{VERSION}{EXE}"
+  },
+  {
+    "name": "opera-proxy",
+    "exe_name": "opera-proxy.exe",
+    "version_args": ["-version"],
+    "version_regex": "(\\d+\\.\\d+\\.\\d+)",
+    "repo": "Alexey71/opera-proxy",
+    "asset_template": "opera-proxy.{OS}-{ARCH}{EXE}"
   }
 ]
