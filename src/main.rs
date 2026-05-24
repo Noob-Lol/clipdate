@@ -19,26 +19,7 @@ use std::{
 ///
 /// Example tools.json:
 /// ```json
-/// [
-///   {
-///     "name": "koyeb",
-///     "exe_name": "koyeb.exe",
-///     "version_args": ["version"],
-///     "version_regex": "(\\d+\\.\\d+\\.\\d+)",
-///     "repo": "koyeb/koyeb-cli",
-///     "asset_template": "koyeb-cli_{VERSION}_windows_amd64.zip",
-///     "zip_entry_template": "koyeb.exe"
-///   },
-///   {
-///     "name": "render",
-///     "exe_name": "render.exe",
-///     "version_args": ["--version"],
-///     "version_regex": "(\\d+\\.\\d+\\.\\d+)",
-///     "repo": "render-oss/cli",
-///     "asset_template": "cli_{VERSION}_windows_amd64.zip",
-///     "zip_entry_template": "cli_v{VERSION}.exe"
-///   }
-/// ]
+#[doc = include_str!("../tools.json")]
 /// ```
 ///
 /// Template variables: {VERSION} is replaced with the resolved latest semver string.
@@ -758,5 +739,12 @@ mod tests {
         }"#;
         let tool2: ToolDef = serde_json::from_str(no_entry_json).unwrap();
         assert_eq!(tool2.archive_entry_template, None);
+    }
+
+    #[test]
+    fn test_tools_json_is_valid() {
+        let json = include_str!("../tools.json");
+        let tools: Vec<ToolDef> = serde_json::from_str(json).unwrap();
+        assert!(tools[0].archive_entry_template.is_some());
     }
 }
