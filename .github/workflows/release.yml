@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: clipdate
+
+jobs:
+  build:
+    name: build (${{ matrix.platform_name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — native
+          - target: x86_64-unknown-linux-gnu
+            platform_name: linux_amd64
+            runner: ubuntu-latest
+            use_cross: false
+            archive_ext: tar.gz
+
+          # Linux aarch64 — cross
+          - target: aarch64-unknown-linux-gnu
+            platform_name: linux_arm64
+            runner: ubuntu-latest
+            use_cross: true
+            archive_ext: tar.gz
+
+          # macOS x86_64 — native
+          - target: x86_64-apple-darwin
+            platform_name: darwin_amd64
+            runner: macos-latest
+            use_cross: false
+            archive_ext: tar.gz
+
+          # macOS Apple Silicon — native on macos-latest (M1 runners)
+          - target: aarch64-apple-darwin
+            platform_name: darwin_arm64
+            runner: macos-latest
+            use_cross: false
+            archive_ext: tar.gz
+
+          # Windows x86_64 — native
+          - target: x86_64-pc-windows-msvc
+            platform_name: windows_amd64
+            runner: windows-latest
+            use_cross: false
+            archive_ext: zip
+
+          # Windows aarch64 — cross-compile on windows runner
+          - target: aarch64-pc-windows-msvc
+            platform_name: windows_arm64
+            runner: windows-latest
+            use_cross: false
+            archive_ext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (cargo)
+        if: "!matrix.use_cross"
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --locked --target ${{ matrix.target }}
+
+      # ---------- package ----------
+
+      - name: Package (tar.gz, Unix)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          BINARY=target/${{ matrix.target }}/release/$BINARY_NAME
+          ARCHIVE="${BINARY_NAME}_${{ github.ref_name }}_${{ matrix.platform_name }}.tar.gz"
+          tar -czf "$ARCHIVE" -C "$(dirname $BINARY)" "$(basename $BINARY)"
+          echo "ASSET=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Package (zip, Windows)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $binary = "target\${{ matrix.target }}\release\$env:BINARY_NAME.exe"
+          $archive = "$env:BINARY_NAME_${{ github.ref_name }}_${{ matrix.platform_name }}.zip"
+          Compress-Archive -Path $binary -DestinationPath $archive
+          "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ASSET }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+  release:
+    name: create GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release and upload assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}  # e.g. v1.0.0-beta → prerelease
