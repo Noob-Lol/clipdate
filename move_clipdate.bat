@@ -1,17 +1,20 @@
 @echo off
 setlocal
+: this is some script for dev
+
 : check choco var
 if not defined ChocolateyInstall (echo "Chocolatey not installed" && goto end)
-
-set "script_path=%~dp0"
+: this script is in hidden .idea dir, because its funny.
+set "REPO_PATH=%~dp0.."
 set "INSTALL_PATH=%ChocolateyInstall%\bin\"
 
 : its rust
-set "RELEASE_PATH=%script_path%\target\release\"
+set "RELEASE_PATH=%REPO_PATH%\target\release\"
 set "BINARY_NAME=clipdate.exe"
+set "BINARY_PATH=%RELEASE_PATH%%BINARY_NAME%"
 
-if exist "%RELEASE_PATH%" (
-    move /y "%RELEASE_PATH%%BINARY_NAME%" "%INSTALL_PATH%"
+if exist "%BINARY_PATH%" (
+    copy /y "%BINARY_PATH%" "%INSTALL_PATH%"
 ) else (
     echo "release binary not found"
     goto end
