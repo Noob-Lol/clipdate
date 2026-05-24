@@ -4,8 +4,8 @@ setlocal
 
 : check choco var
 if not defined ChocolateyInstall (echo "Chocolatey not installed" && goto end)
-: this script is in hidden .idea dir, because its funny.
-set "REPO_PATH=%~dp0.."
+
+set "REPO_PATH=%~dp0"
 set "INSTALL_PATH=%ChocolateyInstall%\bin\"
 
 : its rust
