@@ -17,11 +17,10 @@ indicatif = "0.18"
 console = "0.16"
 
 [profile.release]
-# opt-level = 3
-debug = false
-lto = true
 codegen-units = 1
-strip = true  # Automatically strip symbols from the binary.
+lto = true
+opt-level = "s"
+strip = true
 
 [build-dependencies]
 winresource = "0.1"
