@@ -91,11 +91,7 @@ fn get_exe_suffix() -> &'static str {
 }
 
 fn get_archive_ext() -> &'static str {
-    if cfg!(windows) {
-        "zip"
-    } else {
-        "tar.gz"
-    }
+    if cfg!(windows) { "zip" } else { "tar.gz" }
 }
 
 fn expand_template(template: &str, version: &str) -> String {
@@ -492,11 +488,17 @@ fn build_client(token: Option<&str>) -> Result<reqwest::blocking::Client> {
     let mut headers = HeaderMap::new();
 
     let repo = option_env!("CLIPDATE_REPO").unwrap_or("Noob-Lol/clipdate");
-    let user_agent = format!("clipdate/{} (https://github.com/{})", env!("CARGO_PKG_VERSION"), repo);
-    
+    let user_agent = format!(
+        "clipdate/{} (https://github.com/{})",
+        env!("CARGO_PKG_VERSION"),
+        repo
+    );
+
     headers.insert(
         USER_AGENT,
-        user_agent.parse().unwrap_or(HeaderValue::from_static("clipdate")),
+        user_agent
+            .parse()
+            .unwrap_or(HeaderValue::from_static("clipdate")),
     );
     headers.insert(
         ACCEPT,
@@ -717,7 +719,7 @@ mod tests {
     #[test]
     fn test_parse_version() {
         let re = Regex::new(r"(\d+\.\d+\.\d+)").unwrap();
-        
+
         // Simple case
         let v = parse_version("v1.2.3", &re).unwrap();
         assert_eq!(v, Version::parse("1.2.3").unwrap());
@@ -745,7 +747,7 @@ mod tests {
         }"#;
         let tool: ToolDef = serde_json::from_str(json).unwrap();
         assert_eq!(tool.archive_entry_template.as_deref(), Some("bin/foo.exe"));
-        
+
         let no_entry_json = r#"{
             "name": "foo",
             "exe_name": "foo.exe",
