@@ -4,9 +4,20 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to simulate (e.g. v1.2.3) — for dry-run testing only"
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
   BINARY_NAME: clipdate
 
 jobs:
@@ -55,6 +66,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+
+      - name: Verify Cargo.toml version matches tag
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/.*= *"//;s/".*//')
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+          echo "✅ Version $CARGO_VERSION matches tag $GITHUB_REF_NAME"
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
