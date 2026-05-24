@@ -70,15 +70,39 @@ struct ToolDef {
     zip_entry_template: Option<String>,
 }
 
+fn get_os() -> &'static str {
+    std::env::consts::OS
+}
+
+fn get_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
+fn get_exe_suffix() -> &'static str {
+    if cfg!(windows) { ".exe" } else { "" }
+}
+
+fn expand_template(template: &str, version: &str) -> String {
+    template
+        .replace("{VERSION}", version)
+        .replace("{OS}", get_os())
+        .replace("{ARCH}", get_arch())
+        .replace("{EXE}", get_exe_suffix())
+}
+
 impl ToolDef {
     fn asset_name(&self, version: &str) -> String {
-        self.asset_template.replace("{VERSION}", version)
+        expand_template(&self.asset_template, version)
     }
 
     fn zip_entry(&self, version: &str) -> Option<String> {
         self.zip_entry_template
             .as_ref()
-            .map(|t| t.replace("{VERSION}", version))
+            .map(|t| expand_template(t, version))
     }
 
     fn download_url(&self, version: &str) -> String {
@@ -265,7 +289,8 @@ fn process_tool(
     client: &reqwest::blocking::Client,
     dry_run: bool,
 ) -> Result<UpdateResult> {
-    let exe_path = install_dir.join(&tool.exe_name);
+    let exe_name = expand_template(&tool.exe_name, "");
+    let exe_path = install_dir.join(&exe_name);
 
     // ── Compile version regex once per tool ──────────────────────────────────
     let version_re = Regex::new(&tool.version_regex).with_context(|| {
@@ -276,12 +301,21 @@ fn process_tool(
     })?;
 
     // ── Current version ──────────────────────────────────────────────────────
-    let current_ver: Option<Version> = run_version_cmd(
-        exe_path.to_str().unwrap_or(&tool.exe_name),
-        &tool.version_args,
-    )
-    .and_then(|out| parse_version(&out, &version_re).ok());
+    let current_ver: Option<Version> =
+        run_version_cmd(exe_path.to_str().unwrap_or(&exe_name), &tool.version_args)
+            .and_then(|out| parse_version(&out, &version_re).ok());
 
+    process_tool_impl(tool, exe_path, current_ver, install_dir, client, dry_run)
+}
+
+fn process_tool_impl(
+    tool: &ToolDef,
+    exe_path: PathBuf,
+    current_ver: Option<Version>,
+    install_dir: &Path,
+    client: &reqwest::blocking::Client,
+    dry_run: bool,
+) -> Result<UpdateResult> {
     // ── Latest version ───────────────────────────────────────────────────────
     let latest_str = fetch_latest_version(client, &tool.repo)?;
     let latest_ver = Version::parse(&latest_str)
@@ -307,7 +341,7 @@ fn process_tool(
     let asset_bytes = download_bytes(client, &url)?;
 
     // ── Extract or direct-write ───────────────────────────────────────────────
-    let tmp_path = install_dir.join(format!("{}.tmp", tool.exe_name));
+    let tmp_path = install_dir.join(format!("{}.tmp", expand_template(&tool.exe_name, "")));
     match tool.zip_entry(&latest_str) {
         Some(zip_entry) => {
             extract_entry(&asset_bytes, &zip_entry, &tmp_path)
@@ -320,10 +354,19 @@ fn process_tool(
         }
     }
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(mut perms) = fs::metadata(&tmp_path).map(|m| m.permissions()) {
+            perms.set_mode(0o755);
+            let _ = fs::set_permissions(&tmp_path, perms);
+        }
+    }
+
     // ── Atomic rename with Windows file-lock workaround ───────────────────────
     // On Windows a running executable cannot be deleted, but it *can* be renamed.
     // Move the old binary aside first so we can put the new one in its place.
-    let old_path = install_dir.join(format!("{}.old", tool.exe_name));
+    let old_path = install_dir.join(format!("{}.old", expand_template(&tool.exe_name, "")));
     if exe_path.exists() {
         // Remove a previous leftover .old if present, ignoring errors.
         let _ = fs::remove_file(&old_path);
@@ -402,11 +445,17 @@ fn build_client(token: Option<&str>) -> Result<reqwest::blocking::Client> {
 }
 
 fn default_install_dir() -> PathBuf {
-    if let Ok(choco) = std::env::var("ChocolateyInstall") {
-        return PathBuf::from(choco).join("bin");
-    }
-    if let Ok(profile) = std::env::var("USERPROFILE") {
-        return PathBuf::from(profile).join(".local").join("bin");
+    if cfg!(windows) {
+        if let Ok(choco) = std::env::var("ChocolateyInstall") {
+            return PathBuf::from(choco).join("bin");
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            return PathBuf::from(profile).join(".local").join("bin");
+        }
+    } else {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(".local").join("bin");
+        }
     }
     PathBuf::from("bin")
 }
