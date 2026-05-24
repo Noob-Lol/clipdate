@@ -1,0 +1,27 @@
+[package]
+name = "clipdate"
+version = "0.1.1"
+edition = "2024"
+description = "CLI tool updater for Windows"
+
+[dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "8", default-features = false, features = ["deflate"] }
+semver = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+regex = "1"
+indicatif = "0.18"
+console = "0.16"
+
+[profile.release]
+# opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+strip = true  # Automatically strip symbols from the binary.
+
+[build-dependencies]
+winresource = "0.1"

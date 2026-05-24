@@ -1,0 +1,527 @@
+use anyhow::{Context, Result, anyhow, bail};
+use clap::Parser;
+use console::style;
+use indicatif::{ProgressBar, ProgressStyle};
+use regex::Regex;
+use semver::Version;
+use serde::Deserialize;
+use std::{
+    fs,
+    io::{self, Read},
+    path::{Path, PathBuf},
+    process::Command,
+    time::Duration,
+};
+
+// ── Config file schema ───────────────────────────────────────────────────────
+
+/// Represents one tool entry in tools.json.
+///
+/// Example tools.json:
+/// ```json
+/// [
+///   {
+///     "name": "koyeb",
+///     "exe_name": "koyeb.exe",
+///     "version_args": ["version"],
+///     "version_regex": "(\\d+\\.\\d+\\.\\d+)",
+///     "repo": "koyeb/koyeb-cli",
+///     "asset_template": "koyeb-cli_{VERSION}_windows_amd64.zip",
+///     "zip_entry_template": "koyeb.exe"
+///   },
+///   {
+///     "name": "render",
+///     "exe_name": "render.exe",
+///     "version_args": ["--version"],
+///     "version_regex": "(\\d+\\.\\d+\\.\\d+)",
+///     "repo": "render-oss/cli",
+///     "asset_template": "cli_{VERSION}_windows_amd64.zip",
+///     "zip_entry_template": "cli_v{VERSION}.exe"
+///   }
+/// ]
+/// ```
+///
+/// Template variables: {VERSION} is replaced with the resolved latest semver string.
+#[derive(Debug, Clone, Deserialize)]
+struct ToolDef {
+    /// Display name, also used to match CLI arguments.
+    name: String,
+
+    /// The executable filename as installed (e.g. "koyeb.exe").
+    exe_name: String,
+
+    /// Arguments passed to the exe to retrieve its version string.
+    version_args: Vec<String>,
+
+    /// Regex with one capture group that extracts the semver from the version output.
+    /// Example: `"(\\d+\\.\\d+\\.\\d+)"`
+    version_regex: String,
+
+    /// GitHub repo in "owner/repo" form.
+    repo: String,
+
+    /// GitHub release asset filename template, e.g. `"koyeb-cli_{VERSION}_windows_amd64.zip"`.
+    asset_template: String,
+
+    /// Path of the entry *inside* the zip that should be extracted, e.g. `"koyeb.exe"` or
+    /// `"cli_v{VERSION}.exe"`.
+    /// If not specified, the asset itself is assumed to be a raw executable file.
+    #[serde(default)]
+    zip_entry_template: Option<String>,
+}
+
+impl ToolDef {
+    fn asset_name(&self, version: &str) -> String {
+        self.asset_template.replace("{VERSION}", version)
+    }
+
+    fn zip_entry(&self, version: &str) -> Option<String> {
+        self.zip_entry_template
+            .as_ref()
+            .map(|t| t.replace("{VERSION}", version))
+    }
+
+    fn download_url(&self, version: &str) -> String {
+        format!(
+            "https://github.com/{}/releases/download/v{}/{}",
+            self.repo,
+            version,
+            self.asset_name(version)
+        )
+    }
+}
+
+// ── GitHub API ───────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GhRelease {
+    tag_name: String,
+}
+
+fn fetch_latest_version(client: &reqwest::blocking::Client, repo: &str) -> Result<String> {
+    let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
+    let resp = client
+        .get(&url)
+        .send()
+        .with_context(|| format!("GET {}", url))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().unwrap_or_default();
+        if status.as_u16() == 403 || status.as_u16() == 429 {
+            bail!(
+                "GitHub rate limit hit for {}. Pass --token / set GITHUB_TOKEN to raise limits.\n{}",
+                repo,
+                body
+            );
+        }
+        bail!("GitHub API error {} for {}: {}", status, repo, body);
+    }
+
+    let release: GhRelease = resp.json().with_context(|| "parsing GitHub release JSON")?;
+    let tag = release.tag_name.trim_start_matches('v').to_string();
+    Ok(tag)
+}
+
+// ── Version detection ────────────────────────────────────────────────────────
+
+/// Run `<exe> <args>` and return the combined stdout+stderr trimmed, or `None`
+/// if the executable is not found / fails to run at all.
+fn run_version_cmd(exe: &str, args: &[String]) -> Option<String> {
+    let out = Command::new(exe).args(args).output().ok()?;
+    // Combine stdout and stderr so version strings printed to either are found.
+    let mut combined = String::with_capacity(out.stdout.len() + out.stderr.len() + 1);
+    combined.push_str(String::from_utf8_lossy(&out.stdout).trim());
+    combined.push('\n');
+    combined.push_str(String::from_utf8_lossy(&out.stderr).trim());
+    Some(combined)
+}
+
+fn parse_version(output: &str, re: &Regex) -> Result<Version> {
+    let cap = re.captures(output).and_then(|c| c.get(1)).ok_or_else(|| {
+        anyhow!(
+            "version pattern '{}' not found in output:\n{}",
+            re.as_str(),
+            output
+        )
+    })?;
+    Version::parse(cap.as_str())
+        .with_context(|| format!("'{}' is not a valid semver", cap.as_str()))
+}
+
+// ── Download + extract ───────────────────────────────────────────────────────
+
+fn download_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>> {
+    let mut resp = client
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {}", url))?;
+
+    if !resp.status().is_success() {
+        bail!("Download failed ({}): {}", resp.status(), url);
+    }
+
+    // Use Content-Length for a rich progress bar, fall back to spinner.
+    let content_len = resp
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+
+    let pb = if let Some(len) = content_len {
+        let pb = ProgressBar::new(len);
+        pb.set_style(
+            ProgressStyle::with_template(
+                "  {spinner:.cyan} {msg}\n  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
+            )
+            .unwrap()
+            .progress_chars("█▉▊▋▌▍▎▏ ")
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        pb
+    } else {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg} {bytes}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        pb
+    };
+    pb.enable_steady_tick(Duration::from_millis(80));
+
+    // Extract just the filename from the URL for a clean display message.
+    let file_name = url.rsplit('/').next().unwrap_or(url);
+    pb.set_message(format!("Downloading {}", file_name));
+
+    // Stream in 8 KB chunks and update the progress bar incrementally.
+    let capacity = content_len
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0);
+    let mut buf = Vec::with_capacity(capacity);
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = resp
+            .read(&mut chunk)
+            .with_context(|| "reading download body")?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        pb.inc(n as u64);
+    }
+
+    pb.finish_and_clear();
+    Ok(buf)
+}
+
+fn extract_entry(zip_bytes: &[u8], entry_name: &str, dest: &Path) -> Result<()> {
+    let cursor = io::Cursor::new(zip_bytes);
+    let mut archive = zip::ZipArchive::new(cursor).context("opening zip")?;
+
+    // Collect matching indices first to avoid borrowing `archive` twice.
+    // Match case-insensitively against both the full path and the basename.
+    let index = (0..archive.len())
+        .find(|&i| {
+            // by_index_raw is cheaper: reads metadata only, no decompression.
+            archive
+                .by_index_raw(i)
+                .map(|f| {
+                    let fname = f.name().replace('\\', "/");
+                    let basename = fname.split('/').next_back().unwrap_or(&fname);
+                    basename.eq_ignore_ascii_case(entry_name)
+                        || f.name().eq_ignore_ascii_case(entry_name)
+                })
+                .unwrap_or(false)
+        })
+        .ok_or_else(|| anyhow!("'{}' not found in zip", entry_name))?;
+
+    // Now open for real (decompressing) using the confirmed index.
+    let mut file = archive.by_index(index).context("reading zip entry")?;
+    let mut out = fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    io::copy(&mut file, &mut out).context("writing extracted file")?;
+    Ok(())
+}
+
+// ── Per-tool update flow ─────────────────────────────────────────────────────
+
+#[derive(Debug)]
+enum UpdateResult {
+    UpToDate(String),
+    Updated {
+        from: String,
+        to: String,
+    },
+    Installed(String),
+    DryRun {
+        current: Option<String>,
+        latest: String,
+    },
+}
+
+fn process_tool(
+    tool: &ToolDef,
+    install_dir: &Path,
+    client: &reqwest::blocking::Client,
+    dry_run: bool,
+) -> Result<UpdateResult> {
+    let exe_path = install_dir.join(&tool.exe_name);
+
+    // ── Compile version regex once per tool ──────────────────────────────────
+    let version_re = Regex::new(&tool.version_regex).with_context(|| {
+        format!(
+            "invalid version_regex for '{}': {}",
+            tool.name, tool.version_regex
+        )
+    })?;
+
+    // ── Current version ──────────────────────────────────────────────────────
+    let current_ver: Option<Version> = run_version_cmd(
+        exe_path.to_str().unwrap_or(&tool.exe_name),
+        &tool.version_args,
+    )
+    .and_then(|out| parse_version(&out, &version_re).ok());
+
+    // ── Latest version ───────────────────────────────────────────────────────
+    let latest_str = fetch_latest_version(client, &tool.repo)?;
+    let latest_ver = Version::parse(&latest_str)
+        .with_context(|| format!("GitHub returned non-semver tag: {}", latest_str))?;
+
+    // ── Dry run ──────────────────────────────────────────────────────────────
+    if dry_run {
+        return Ok(UpdateResult::DryRun {
+            current: current_ver.map(|v| v.to_string()),
+            latest: latest_ver.to_string(),
+        });
+    }
+
+    // ── Up-to-date check ─────────────────────────────────────────────────────
+    if let Some(ref cur) = current_ver
+        && *cur >= latest_ver
+    {
+        return Ok(UpdateResult::UpToDate(cur.to_string()));
+    }
+
+    // ── Download ─────────────────────────────────────────────────────────────
+    let url = tool.download_url(&latest_str);
+    let asset_bytes = download_bytes(client, &url)?;
+
+    // ── Extract or direct-write ───────────────────────────────────────────────
+    let tmp_path = install_dir.join(format!("{}.tmp", tool.exe_name));
+    match tool.zip_entry(&latest_str) {
+        Some(zip_entry) => {
+            extract_entry(&asset_bytes, &zip_entry, &tmp_path)
+                .with_context(|| format!("extracting '{}' from zip", zip_entry))?;
+        }
+        None => {
+            // Asset is a raw executable — write it directly.
+            fs::write(&tmp_path, &asset_bytes)
+                .with_context(|| format!("writing {}", tmp_path.display()))?;
+        }
+    }
+
+    // ── Atomic rename with Windows file-lock workaround ───────────────────────
+    // On Windows a running executable cannot be deleted, but it *can* be renamed.
+    // Move the old binary aside first so we can put the new one in its place.
+    let old_path = install_dir.join(format!("{}.old", tool.exe_name));
+    if exe_path.exists() {
+        // Remove a previous leftover .old if present, ignoring errors.
+        let _ = fs::remove_file(&old_path);
+        fs::rename(&exe_path, &old_path)
+            .with_context(|| format!("renaming {} to .old", exe_path.display()))?;
+    }
+    fs::rename(&tmp_path, &exe_path)
+        .with_context(|| format!("renaming tmp to {}", exe_path.display()))?;
+    // Best-effort removal of the .old file; ignore if still locked.
+    let _ = fs::remove_file(&old_path);
+
+    match current_ver {
+        Some(cur) => Ok(UpdateResult::Updated {
+            from: cur.to_string(),
+            to: latest_ver.to_string(),
+        }),
+        None => Ok(UpdateResult::Installed(latest_ver.to_string())),
+    }
+}
+
+// ── CLI ──────────────────────────────────────────────────────────────────────
+
+/// Update self-contained CLI tools fetched from GitHub releases.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// Tool names to update. If omitted, all tools in the config are updated.
+    tools: Vec<String>,
+
+    /// Path to the tools config JSON (default: tools.json next to the binary).
+    /// Can also be set via the CLIPDATE_CONFIG environment variable.
+    #[arg(long, short, env = "CLIPDATE_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Directory where tools are installed (default: %ChocolateyInstall%\bin or ./bin).
+    #[arg(long, short)]
+    install_dir: Option<PathBuf>,
+
+    /// GitHub Personal Access Token for higher API rate limits.
+    /// Can also be set via the GITHUB_TOKEN environment variable.
+    #[arg(long, short, env = "GITHUB_TOKEN")]
+    token: Option<String>,
+
+    /// Show what would be updated without downloading anything.
+    #[arg(long, short = 'n')]
+    dry_run: bool,
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
+
+fn build_client(token: Option<&str>) -> Result<reqwest::blocking::Client> {
+    use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
+
+    let mut headers = HeaderMap::new();
+    // from_static is infallible and avoids a heap allocation for compile-time strings.
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_static("clipdate/0.1 (https://github.com/yourorg/clipdate)"),
+    );
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("application/vnd.github+json"),
+    );
+    if let Some(tok) = token {
+        let auth = format!("Bearer {tok}");
+        headers.insert(
+            AUTHORIZATION,
+            auth.parse().with_context(|| "invalid token header value")?,
+        );
+    }
+    reqwest::blocking::Client::builder()
+        .default_headers(headers)
+        .timeout(Duration::from_secs(60))
+        .build()
+        .context("building HTTP client")
+}
+
+fn default_install_dir() -> PathBuf {
+    if let Ok(choco) = std::env::var("ChocolateyInstall") {
+        return PathBuf::from(choco).join("bin");
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        return PathBuf::from(profile).join(".local").join("bin");
+    }
+    PathBuf::from("bin")
+}
+
+/// Remove any leftover `<exe>.old` files in `install_dir` from a previous
+/// interrupted update. Called once at startup.
+fn clean_old_files(install_dir: &Path) {
+    let Ok(entries) = fs::read_dir(install_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("old") {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+fn default_config_path() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("tools.json")))
+        .unwrap_or_else(|| PathBuf::from("tools.json"))
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // ── Load config ──────────────────────────────────────────────────────────
+    let config_path = cli.config.unwrap_or_else(default_config_path);
+    let config_str = fs::read_to_string(&config_path)
+        .with_context(|| format!("reading config: {}", config_path.display()))?;
+    let all_tools: Vec<ToolDef> =
+        serde_json::from_str(&config_str).with_context(|| "parsing tools.json")?;
+
+    // ── Filter tools ─────────────────────────────────────────────────────────
+    let tools: Vec<&ToolDef> = if cli.tools.is_empty() {
+        all_tools.iter().collect()
+    } else {
+        let mut filtered = Vec::with_capacity(cli.tools.len());
+        for name in &cli.tools {
+            match all_tools.iter().find(|t| t.name.eq_ignore_ascii_case(name)) {
+                Some(t) => filtered.push(t),
+                None => {
+                    let available = all_tools
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    bail!("unknown tool '{}'. Available: {}", name, available);
+                }
+            }
+        }
+        filtered
+    };
+
+    let install_dir = cli.install_dir.unwrap_or_else(default_install_dir);
+    fs::create_dir_all(&install_dir)
+        .with_context(|| format!("creating install dir: {}", install_dir.display()))?;
+
+    // Purge leftover .old files from any previous interrupted update.
+    clean_old_files(&install_dir);
+
+    let client = build_client(cli.token.as_deref())?;
+
+    if cli.dry_run {
+        println!(
+            "{}",
+            style("Dry-run mode — nothing will be downloaded.").yellow()
+        );
+    }
+
+    // ── Process each tool ────────────────────────────────────────────────────
+    let mut errors = 0usize;
+    for tool in &tools {
+        let label = style(&tool.name).bold();
+        match process_tool(tool, &install_dir, &client, cli.dry_run) {
+            Ok(UpdateResult::UpToDate(v)) => {
+                println!("{} {} up to date ({})", style("✓").green(), label, v);
+            }
+            Ok(UpdateResult::Updated { from, to }) => {
+                println!(
+                    "{} {} {} → {}",
+                    style("↑").cyan(),
+                    label,
+                    style(from).dim(),
+                    style(to).green()
+                );
+            }
+            Ok(UpdateResult::Installed(v)) => {
+                println!("{} {} installed ({})", style("✓").green(), label, v);
+            }
+            Ok(UpdateResult::DryRun { current, latest }) => {
+                let cur_str = current.as_deref().unwrap_or("not installed");
+                if current.as_deref() == Some(&latest) {
+                    println!("{} {} up to date ({})", style("·").dim(), label, latest);
+                } else {
+                    println!(
+                        "{} {} would update: {} → {}",
+                        style("→").yellow(),
+                        label,
+                        style(cur_str).dim(),
+                        style(&latest).green()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("{} {}: {:#}", style("✗").red(), label, e);
+                errors += 1;
+            }
+        }
+    }
+
+    if errors > 0 {
+        bail!("{} tool(s) failed to update", errors);
+    }
+    Ok(())
+}
