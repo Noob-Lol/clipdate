@@ -387,6 +387,29 @@ fn process_tool_impl(
     }
 }
 
+fn perform_self_update(
+    install_dir: &Path,
+    client: &reqwest::blocking::Client,
+    dry_run: bool,
+) -> Result<UpdateResult> {
+    let repo = option_env!("CLIPDATE_REPO").unwrap_or("Noob-Lol/clipdate");
+    let exe_suffix = get_exe_suffix();
+    let tool = ToolDef {
+        name: "clipdate".to_string(),
+        exe_name: format!("clipdate{}", exe_suffix),
+        version_args: vec![],
+        version_regex: "".to_string(),
+        repo: repo.to_string(),
+        asset_template: "clipdate_{VERSION}_{OS}_{ARCH}.zip".to_string(),
+        zip_entry_template: Some(format!("clipdate{}", exe_suffix)),
+    };
+
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| install_dir.join(&tool.exe_name));
+    let current_ver = Version::parse(env!("CARGO_PKG_VERSION")).ok();
+
+    process_tool_impl(&tool, exe_path, current_ver, install_dir, client, dry_run)
+}
+
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
 /// Update self-contained CLI tools fetched from GitHub releases.
@@ -413,6 +436,10 @@ struct Cli {
     /// Show what would be updated without downloading anything.
     #[arg(long, short = 'n')]
     dry_run: bool,
+
+    /// Update clipdate itself.
+    #[arg(long)]
+    self_update: bool,
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────────
@@ -424,7 +451,7 @@ fn build_client(token: Option<&str>) -> Result<reqwest::blocking::Client> {
     // from_static is infallible and avoids a heap allocation for compile-time strings.
     headers.insert(
         USER_AGENT,
-        HeaderValue::from_static("clipdate/0.1 (https://github.com/yourorg/clipdate)"),
+        HeaderValue::from_static("clipdate/0.1 (https://github.com/Noob-Lol/clipdate)"),
     );
     headers.insert(
         ACCEPT,
@@ -526,6 +553,46 @@ fn main() -> Result<()> {
             "{}",
             style("Dry-run mode — nothing will be downloaded.").yellow()
         );
+    }
+
+    if cli.self_update {
+        let label = style("clipdate (self-update)").bold();
+        match perform_self_update(&install_dir, &client, cli.dry_run) {
+            Ok(UpdateResult::UpToDate(v)) => {
+                println!("{} {} up to date ({})", style("✓").green(), label, v);
+            }
+            Ok(UpdateResult::Updated { from, to }) => {
+                println!(
+                    "{} {} {} → {}",
+                    style("↑").cyan(),
+                    label,
+                    style(from).dim(),
+                    style(to).green()
+                );
+            }
+            Ok(UpdateResult::Installed(v)) => {
+                println!("{} {} installed ({})", style("✓").green(), label, v);
+            }
+            Ok(UpdateResult::DryRun { current, latest }) => {
+                let cur_str = current.as_deref().unwrap_or("not installed");
+                if current.as_deref() == Some(&latest) {
+                    println!("{} {} up to date ({})", style("·").dim(), label, latest);
+                } else {
+                    println!(
+                        "{} {} would update: {} → {}",
+                        style("→").yellow(),
+                        label,
+                        style(cur_str).dim(),
+                        style(&latest).green()
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("{} {}: {:#}", style("✗").red(), label, e);
+                std::process::exit(1);
+            }
+        }
+        return Ok(());
     }
 
     // ── Process each tool ────────────────────────────────────────────────────
