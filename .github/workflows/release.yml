@@ -92,7 +92,7 @@ jobs:
         shell: bash
         run: |
           BINARY=target/${{ matrix.target }}/release/$BINARY_NAME
-          ARCHIVE="${BINARY_NAME}_${{ github.ref_name }}_${{ matrix.platform_name }}.tar.gz"
+          ARCHIVE="${BINARY_NAME}_${{ github.ref_name#v }}_${{ matrix.platform_name }}.tar.gz"
           tar -czf "$ARCHIVE" -C "$(dirname $BINARY)" "$(basename $BINARY)"
           echo "ASSET=$ARCHIVE" >> "$GITHUB_ENV"
 
@@ -101,7 +101,8 @@ jobs:
         shell: pwsh
         run: |
           $binary = "target\${{ matrix.target }}\release\$env:BINARY_NAME.exe"
-          $archive = "$env:BINARY_NAME_${{ github.ref_name }}_${{ matrix.platform_name }}.zip"
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          $archive = "$env:BINARY_NAME-$version-${{ matrix.platform_name }}.zip"
           Compress-Archive -Path $binary -DestinationPath $archive
           "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
