@@ -2,7 +2,7 @@
 name = "clipdate"
 version = "0.1.1"
 edition = "2024"
-description = "CLI tool updater for Windows"
+description = "CLI tool updater"
 
 [dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
