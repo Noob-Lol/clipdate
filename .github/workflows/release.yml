@@ -109,7 +109,7 @@ jobs:
         run: |
           $binary = "target\${{ matrix.target }}\release\$env:BINARY_NAME.exe"
           $version = "${{ github.ref_name }}" -replace '^v', ''
-          $archive = "$env:BINARY_NAME-$version-${{ matrix.platform_name }}.zip"
+          $archive = "$env:BINARY_NAME_$version_${{ matrix.platform_name }}.zip"
           Compress-Archive -Path $binary -DestinationPath $archive
           "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
 
