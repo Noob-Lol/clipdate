@@ -1,4 +1,10 @@
 fn main() {
+    // Expose the full Rust target triple as a compile-time env var so the
+    // self-update logic can build the correct cargo-dist asset filename.
+    // e.g. "x86_64-pc-windows-msvc", "aarch64-apple-darwin", etc.
+    let target = std::env::var("TARGET").expect("Cargo always sets TARGET");
+    println!("cargo:rustc-env=CLIPDATE_TARGET={target}");
+
     // Only embed resources when targeting Windows.
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winresource::WindowsResource::new();

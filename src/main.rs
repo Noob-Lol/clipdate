@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use console::style;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use regex::Regex;
 use semver::Version;
 use serde::Deserialize;
@@ -51,6 +52,14 @@ struct ToolDef {
     archive_entry_template: Option<String>,
 }
 
+fn get_own_repo() -> &'static str {
+    option_env!("CLIPDATE_REPO").unwrap_or("Noob-Lol/clipdate")
+}
+
+fn get_own_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 fn get_os() -> &'static str {
     if std::env::consts::OS == "macos" {
         "darwin"
@@ -67,6 +76,12 @@ fn get_arch() -> &'static str {
     }
 }
 
+/// Full Rust target triple, e.g. `x86_64-pc-windows-msvc` or `aarch64-apple-darwin`.
+/// Baked in at compile time via build.rs — matches what cargo-dist uses in asset filenames.
+fn get_target() -> &'static str {
+    env!("CLIPDATE_TARGET")
+}
+
 fn get_exe_suffix() -> &'static str {
     if cfg!(windows) { ".exe" } else { "" }
 }
@@ -80,6 +95,7 @@ fn expand_template(template: &str, version: &str) -> String {
         .replace("{VERSION}", version)
         .replace("{OS}", get_os())
         .replace("{ARCH}", get_arch())
+        .replace("{TARGET}", get_target())
         .replace("{EXE}", get_exe_suffix())
         .replace("{EXT}", get_archive_ext())
 }
@@ -165,7 +181,11 @@ fn parse_version(output: &str, re: &Regex) -> Result<Version> {
 
 // ── Download + extract ───────────────────────────────────────────────────────
 
-fn download_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u8>> {
+fn download_bytes(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    mp: &MultiProgress,
+) -> Result<Vec<u8>> {
     let mut resp = client
         .get(url)
         .send()
@@ -182,8 +202,9 @@ fn download_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<u64>().ok());
 
+    // Register with MultiProgress so concurrent bars don't overwrite each other.
     let pb = if let Some(len) = content_len {
-        let pb = ProgressBar::new(len);
+        let pb = mp.add(ProgressBar::new(len));
         pb.set_style(
             ProgressStyle::with_template(
                 "  {spinner:.cyan} {msg}\n  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
@@ -194,7 +215,7 @@ fn download_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u
         );
         pb
     } else {
-        let pb = ProgressBar::new_spinner();
+        let pb = mp.add(ProgressBar::new_spinner());
         pb.set_style(
             ProgressStyle::with_template("{spinner:.cyan} {msg} {bytes}")
                 .unwrap()
@@ -208,12 +229,12 @@ fn download_bytes(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<u
     let file_name = url.rsplit('/').next().unwrap_or(url);
     pb.set_message(format!("Downloading {}", file_name));
 
-    // Stream in 8 KB chunks and update the progress bar incrementally.
+    // Stream in 64 KB chunks — reduces syscall overhead vs the old 8 KB size.
     let capacity = content_len
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(0);
     let mut buf = Vec::with_capacity(capacity);
-    let mut chunk = [0u8; 8192];
+    let mut chunk = [0u8; 65536];
     loop {
         let n = resp
             .read(&mut chunk)
@@ -300,6 +321,7 @@ fn process_tool(
     install_dir: &Path,
     client: &reqwest::blocking::Client,
     dry_run: bool,
+    mp: &MultiProgress,
 ) -> Result<UpdateResult> {
     let exe_name = expand_template(&tool.exe_name, "");
     let exe_path = install_dir.join(&exe_name);
@@ -317,7 +339,15 @@ fn process_tool(
         run_version_cmd(exe_path.to_str().unwrap_or(&exe_name), &tool.version_args)
             .and_then(|out| parse_version(&out, &version_re).ok());
 
-    process_tool_impl(tool, exe_path, current_ver, install_dir, client, dry_run)
+    process_tool_impl(
+        tool,
+        exe_path,
+        current_ver,
+        install_dir,
+        client,
+        dry_run,
+        mp,
+    )
 }
 
 fn process_tool_impl(
@@ -327,6 +357,7 @@ fn process_tool_impl(
     install_dir: &Path,
     client: &reqwest::blocking::Client,
     dry_run: bool,
+    mp: &MultiProgress,
 ) -> Result<UpdateResult> {
     // ── Latest version ───────────────────────────────────────────────────────
     let latest_str = fetch_latest_version(client, &tool.repo)?;
@@ -350,7 +381,7 @@ fn process_tool_impl(
 
     // ── Download ─────────────────────────────────────────────────────────────
     let url = tool.download_url(&latest_str);
-    let asset_bytes = download_bytes(client, &url)?;
+    let asset_bytes = download_bytes(client, &url, mp)?;
 
     // ── Extract or direct-write ───────────────────────────────────────────────
     let tmp_path = install_dir.join(format!("{}.tmp", expand_template(&tool.exe_name, "")));
@@ -410,8 +441,9 @@ fn perform_self_update(
     install_dir: &Path,
     client: &reqwest::blocking::Client,
     dry_run: bool,
+    mp: &MultiProgress,
 ) -> Result<UpdateResult> {
-    let repo = option_env!("CLIPDATE_REPO").unwrap_or("Noob-Lol/clipdate");
+    let repo = get_own_repo();
     let exe_suffix = get_exe_suffix();
     let tool = ToolDef {
         name: "clipdate".to_string(),
@@ -419,14 +451,24 @@ fn perform_self_update(
         version_args: vec![],
         version_regex: "".to_string(),
         repo: repo.to_string(),
-        asset_template: "clipdate_{VERSION}_{OS}_{ARCH}.{EXT}".to_string(),
+        // cargo-dist names assets as "<binary>-<version>-<target-triple>.<ext>"
+        // e.g. clipdate-0.1.3-x86_64-pc-windows-msvc.zip
+        asset_template: "clipdate-{VERSION}-{TARGET}.{EXT}".to_string(),
         archive_entry_template: Some(format!("clipdate{}", exe_suffix)),
     };
 
     let exe_path = std::env::current_exe().unwrap_or_else(|_| install_dir.join(&tool.exe_name));
-    let current_ver = Version::parse(env!("CARGO_PKG_VERSION")).ok();
+    let current_ver = Version::parse(get_own_version()).ok();
 
-    process_tool_impl(&tool, exe_path, current_ver, install_dir, client, dry_run)
+    process_tool_impl(
+        &tool,
+        exe_path,
+        current_ver,
+        install_dir,
+        client,
+        dry_run,
+        mp,
+    )
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -443,8 +485,9 @@ struct Cli {
     #[arg(long, short, env = "CLIPDATE_CONFIG")]
     config: Option<PathBuf>,
 
-    /// Directory where tools are installed (default: %ChocolateyInstall%\bin or ./bin).
-    #[arg(long, short)]
+    /// Directory where tools are installed (default: %ChocolateyInstall%\bin or ~/.local/bin).
+    /// Can also be set via the CLIPDATE_INSTALL_DIR environment variable.
+    #[arg(long, short, env = "CLIPDATE_INSTALL_DIR")]
     install_dir: Option<PathBuf>,
 
     /// GitHub Personal Access Token for higher API rate limits.
@@ -461,17 +504,64 @@ struct Cli {
     self_update: bool,
 }
 
+// ── Output helpers ───────────────────────────────────────────────────────────
+
+/// Print the result of a single tool update and return `true` if it was an error.
+/// Both `self_update` and the parallel tool loop use identical formatting,
+/// so centralising it here eliminates the duplication.
+fn print_update_result(label: impl std::fmt::Display, result: Result<UpdateResult>) -> bool {
+    match result {
+        Ok(UpdateResult::UpToDate(v)) => {
+            println!("{} {} up to date ({})", style("✓").green(), label, v);
+            false
+        }
+        Ok(UpdateResult::Updated { from, to }) => {
+            println!(
+                "{} {} {} \u{2192} {}",
+                style("\u{2191}").cyan(),
+                label,
+                style(from).dim(),
+                style(to).green()
+            );
+            false
+        }
+        Ok(UpdateResult::Installed(v)) => {
+            println!("{} {} installed ({})", style("✓").green(), label, v);
+            false
+        }
+        Ok(UpdateResult::DryRun { current, latest }) => {
+            let cur_str = current.as_deref().unwrap_or("not installed");
+            if current.as_deref() == Some(&latest) {
+                println!("{} {} up to date ({})", style("·").dim(), label, latest);
+            } else {
+                println!(
+                    "{} {} would update: {} \u{2192} {}",
+                    style("\u{2192}").yellow(),
+                    label,
+                    style(cur_str).dim(),
+                    style(&latest).green()
+                );
+            }
+            false
+        }
+        Err(e) => {
+            eprintln!("{} {}: {:#}", style("✗").red(), label, e);
+            true
+        }
+    }
+}
+
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 fn build_client(token: Option<&str>) -> Result<reqwest::blocking::Client> {
-    use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderValue, USER_AGENT};
+    use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 
     let mut headers = HeaderMap::new();
 
-    let repo = option_env!("CLIPDATE_REPO").unwrap_or("Noob-Lol/clipdate");
+    let repo = get_own_repo();
     let user_agent = format!(
         "clipdate/{} (https://github.com/{})",
-        env!("CARGO_PKG_VERSION"),
+        get_own_version(),
         repo
     );
 
@@ -484,6 +574,12 @@ fn build_client(token: Option<&str>) -> Result<reqwest::blocking::Client> {
     headers.insert(
         ACCEPT,
         HeaderValue::from_static("application/vnd.github+json"),
+    );
+    // Pin the GitHub REST API version for a stable contract.
+    // See https://docs.github.com/en/rest/about-the-rest-api/api-versions
+    headers.insert(
+        HeaderName::from_static("x-github-api-version"),
+        HeaderValue::from_static("2022-11-28"),
     );
     if let Some(tok) = token {
         let auth = format!("Bearer {tok}");
@@ -583,86 +679,33 @@ fn main() -> Result<()> {
         );
     }
 
+    let mp = MultiProgress::new();
+
     if cli.self_update {
         let label = style("clipdate (self-update)").bold();
-        match perform_self_update(&install_dir, &client, cli.dry_run) {
-            Ok(UpdateResult::UpToDate(v)) => {
-                println!("{} {} up to date ({})", style("✓").green(), label, v);
-            }
-            Ok(UpdateResult::Updated { from, to }) => {
-                println!(
-                    "{} {} {} → {}",
-                    style("↑").cyan(),
-                    label,
-                    style(from).dim(),
-                    style(to).green()
-                );
-            }
-            Ok(UpdateResult::Installed(v)) => {
-                println!("{} {} installed ({})", style("✓").green(), label, v);
-            }
-            Ok(UpdateResult::DryRun { current, latest }) => {
-                let cur_str = current.as_deref().unwrap_or("not installed");
-                if current.as_deref() == Some(&latest) {
-                    println!("{} {} up to date ({})", style("·").dim(), label, latest);
-                } else {
-                    println!(
-                        "{} {} would update: {} → {}",
-                        style("→").yellow(),
-                        label,
-                        style(cur_str).dim(),
-                        style(&latest).green()
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("{} {}: {:#}", style("✗").red(), label, e);
-                std::process::exit(1);
-            }
+        let result = perform_self_update(&install_dir, &client, cli.dry_run, &mp);
+        if print_update_result(label, result) {
+            std::process::exit(1);
         }
         return Ok(());
     }
 
-    // ── Process each tool ────────────────────────────────────────────────────
-    let mut errors = 0usize;
-    for tool in &tools {
-        let label = style(&tool.name).bold();
-        match process_tool(tool, &install_dir, &client, cli.dry_run) {
-            Ok(UpdateResult::UpToDate(v)) => {
-                println!("{} {} up to date ({})", style("✓").green(), label, v);
-            }
-            Ok(UpdateResult::Updated { from, to }) => {
-                println!(
-                    "{} {} {} → {}",
-                    style("↑").cyan(),
-                    label,
-                    style(from).dim(),
-                    style(to).green()
-                );
-            }
-            Ok(UpdateResult::Installed(v)) => {
-                println!("{} {} installed ({})", style("✓").green(), label, v);
-            }
-            Ok(UpdateResult::DryRun { current, latest }) => {
-                let cur_str = current.as_deref().unwrap_or("not installed");
-                if current.as_deref() == Some(&latest) {
-                    println!("{} {} up to date ({})", style("·").dim(), label, latest);
-                } else {
-                    println!(
-                        "{} {} would update: {} → {}",
-                        style("→").yellow(),
-                        label,
-                        style(cur_str).dim(),
-                        style(&latest).green()
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!("{} {}: {:#}", style("✗").red(), label, e);
-                errors += 1;
-            }
-        }
-    }
+    // ── Process each tool (in parallel) ─────────────────────────────────────
+    // Collect all results first so progress bars finish before we print summaries.
+    let results: Vec<(&ToolDef, Result<UpdateResult>)> = tools
+        .par_iter()
+        .map(|tool| {
+            (
+                *tool,
+                process_tool(tool, &install_dir, &client, cli.dry_run, &mp),
+            )
+        })
+        .collect();
+
+    let errors: usize = results
+        .into_iter()
+        .map(|(tool, result)| print_update_result(style(&tool.name).bold(), result) as usize)
+        .sum();
 
     if errors > 0 {
         bail!("{} tool(s) failed to update", errors);
