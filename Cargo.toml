@@ -25,7 +25,7 @@ flate2 = "1.0"
 
 [profile.release]
 codegen-units = 1
-lto = true
+lto = "thin"
 opt-level = "s"
 strip = true
 
