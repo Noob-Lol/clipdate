@@ -486,8 +486,8 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Directory where tools are installed (default: %ChocolateyInstall%\bin or ~/.local/bin).
-    /// Can also be set via the CLIPDATE_INSTALL_DIR environment variable.
-    #[arg(long, short, env = "CLIPDATE_INSTALL_DIR")]
+    /// Can also be set via the CLIPDATE_BIN_DIR environment variable.
+    #[arg(long, short, env = "CLIPDATE_BIN_DIR")]
     install_dir: Option<PathBuf>,
 
     /// GitHub Personal Access Token for higher API rate limits.
@@ -517,8 +517,8 @@ fn print_update_result(label: impl std::fmt::Display, result: Result<UpdateResul
         }
         Ok(UpdateResult::Updated { from, to }) => {
             println!(
-                "{} {} {} \u{2192} {}",
-                style("\u{2191}").cyan(),
+                "{} {} {} → {}",
+                style("↑").cyan(),
                 label,
                 style(from).dim(),
                 style(to).green()
@@ -535,8 +535,8 @@ fn print_update_result(label: impl std::fmt::Display, result: Result<UpdateResul
                 println!("{} {} up to date ({})", style("·").dim(), label, latest);
             } else {
                 println!(
-                    "{} {} would update: {} \u{2192} {}",
-                    style("\u{2192}").yellow(),
+                    "{} {} would update: {} → {}",
+                    style("→").yellow(),
                     label,
                     style(cur_str).dim(),
                     style(&latest).green()
