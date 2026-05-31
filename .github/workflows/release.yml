@@ -24,6 +24,8 @@ jobs:
   build:
     name: build (${{ matrix.platform_name }})
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -93,31 +95,38 @@ jobs:
 
       # ---------- package ----------
 
-      - name: Package (tar.gz, Unix)
-        if: matrix.archive_ext == 'tar.gz'
+      - name: Package
+        id: package
         shell: bash
         run: |
-          BINARY=target/${{ matrix.target }}/release/$BINARY_NAME
           VERSION="${{ github.ref_name }}"
-          ARCHIVE="${BINARY_NAME}_${VERSION#v}_${{ matrix.platform_name }}.tar.gz"
-          tar -czf "$ARCHIVE" -C "$(dirname $BINARY)" "$(basename $BINARY)"
-          echo "ASSET=$ARCHIVE" >> "$GITHUB_ENV"
+          VERSION="${VERSION#v}"
+          EXT="${{ matrix.archive_ext }}"
+          ARCHIVE="${BINARY_NAME}_${VERSION}_${{ matrix.platform_name }}.${EXT}"
 
-      - name: Package (zip, Windows)
-        if: matrix.archive_ext == 'zip'
-        shell: pwsh
-        run: |
-          $binary = "target\${{ matrix.target }}\release\$env:BINARY_NAME.exe"
-          $version = "${{ github.ref_name }}" -replace '^v', ''
-          $archive = "$env:BINARY_NAME_$version_${{ matrix.platform_name }}.zip"
-          Compress-Archive -Path $binary -DestinationPath $archive
-          "ASSET=$archive" | Out-File -FilePath $env:GITHUB_ENV -Append
+          # binary has .exe on Windows
+          BINARY="target/${{ matrix.target }}/release/${BINARY_NAME}"
+          [ "$EXT" = "zip" ] && BINARY="${BINARY}.exe"
+
+          # include binary + metadata files (skip missing ones gracefully)
+          FILES=("$BINARY")
+          for f in README.md LICENSE LICENSE-MIT LICENSE-APACHE; do
+            [ -f "$f" ] && FILES+=("$f")
+          done
+
+          if [ "$EXT" = "tar.gz" ]; then
+            tar -czf "$ARCHIVE" "${FILES[@]}"
+          else
+            7z a "$ARCHIVE" "${FILES[@]}" > /dev/null
+          fi
+
+          echo "asset=$ARCHIVE" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.ASSET }}
-          path: ${{ env.ASSET }}
+          name: ${{ steps.package.outputs.asset }}
+          path: ${{ steps.package.outputs.asset }}
           if-no-files-found: error
 
   release:
@@ -133,6 +142,12 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS  # print to log for easy verification
 
       - name: Create release and upload assets
         uses: softprops/action-gh-release@v3
