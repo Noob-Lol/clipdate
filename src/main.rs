@@ -451,9 +451,8 @@ fn perform_self_update(
         version_args: vec![],
         version_regex: "".to_string(),
         repo: repo.to_string(),
-        // cargo-dist names assets as "<binary>-<version>-<target-triple>.<ext>"
-        // e.g. clipdate-0.1.3-x86_64-pc-windows-msvc.zip
-        asset_template: "clipdate-{VERSION}-{TARGET}.{EXT}".to_string(),
+        // our names are Go style, <binary>_<version>_<os>_<arch>.<ext>, basically {NAME}_{VERSION}_{OS}_{ARCH}.{EXT}
+        asset_template: "clipdate_{VERSION}_{OS}_{ARCH}.{EXT}".to_string(),
         archive_entry_template: Some(format!("clipdate{}", exe_suffix)),
     };
 

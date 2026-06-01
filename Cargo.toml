@@ -1,6 +1,6 @@
 [package]
 name = "clipdate"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "CLI tool updater"
 authors = ["Noob Lol"]
@@ -30,14 +30,6 @@ codegen-units = 1
 lto = "thin"
 opt-level = "s"
 strip = true
-
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
-
-[package.metadata.dist]
-dist = true
 
 [build-dependencies]
 winresource = "0.1"
