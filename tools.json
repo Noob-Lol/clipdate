@@ -19,7 +19,7 @@
   },
   {
     "name": "opera-proxy",
-    "exe_name": "opera-proxy.exe",
+    "exe_name": "opera-proxy{EXE}",
     "version_args": ["-version"],
     "version_regex": "(\\d+\\.\\d+\\.\\d+)",
     "repo": "Alexey71/opera-proxy",
