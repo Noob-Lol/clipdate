@@ -31,13 +31,5 @@ lto = "thin"
 opt-level = "s"
 strip = true
 
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
-
-[package.metadata.dist]
-dist = true
-
 [build-dependencies]
 winresource = "0.1"
