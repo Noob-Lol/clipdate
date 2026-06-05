@@ -123,12 +123,23 @@ impl ToolDef {
 
 // ── GitHub API ───────────────────────────────────────────────────────────────
 
+#[derive(Deserialize, Clone)]
+struct GhAsset {
+    name: String,
+    browser_download_url: String,
+}
+
 #[derive(Deserialize)]
 struct GhRelease {
     tag_name: String,
+    #[serde(default)]
+    assets: Vec<GhAsset>,
 }
 
-fn fetch_latest_version(client: &reqwest::blocking::Client, repo: &str) -> Result<String> {
+fn fetch_latest_version(
+    client: &reqwest::blocking::Client,
+    repo: &str,
+) -> Result<(String, Vec<GhAsset>)> {
     let url = format!("https://api.github.com/repos/{}/releases/latest", repo);
     let resp = client
         .get(&url)
@@ -150,7 +161,7 @@ fn fetch_latest_version(client: &reqwest::blocking::Client, repo: &str) -> Resul
 
     let release: GhRelease = resp.json().with_context(|| "parsing GitHub release JSON")?;
     let tag = release.tag_name.trim_start_matches('v').to_string();
-    Ok(tag)
+    Ok((tag, release.assets))
 }
 
 // ── Version detection ────────────────────────────────────────────────────────
@@ -302,6 +313,14 @@ fn extract_tar_gz(tar_gz_bytes: &[u8], entry_name: &str, dest: &Path) -> Result<
 
 // ── Per-tool update flow ─────────────────────────────────────────────────────
 
+struct UpdateCtx<'a> {
+    install_dir: &'a Path,
+    client: &'a reqwest::blocking::Client,
+    mp: &'a MultiProgress,
+    dry_run: bool,
+    force: bool,
+}
+
 #[derive(Debug)]
 enum UpdateResult {
     UpToDate(String),
@@ -316,15 +335,9 @@ enum UpdateResult {
     },
 }
 
-fn process_tool(
-    tool: &ToolDef,
-    install_dir: &Path,
-    client: &reqwest::blocking::Client,
-    dry_run: bool,
-    mp: &MultiProgress,
-) -> Result<UpdateResult> {
+fn process_tool(tool: &ToolDef, ctx: &UpdateCtx<'_>) -> Result<UpdateResult> {
     let exe_name = expand_template(&tool.exe_name, "");
-    let exe_path = install_dir.join(&exe_name);
+    let exe_path = ctx.install_dir.join(&exe_name);
 
     // ── Compile version regex once per tool ──────────────────────────────────
     let version_re = Regex::new(&tool.version_regex).with_context(|| {
@@ -339,33 +352,22 @@ fn process_tool(
         run_version_cmd(exe_path.to_str().unwrap_or(&exe_name), &tool.version_args)
             .and_then(|out| parse_version(&out, &version_re).ok());
 
-    process_tool_impl(
-        tool,
-        exe_path,
-        current_ver,
-        install_dir,
-        client,
-        dry_run,
-        mp,
-    )
+    process_tool_impl(tool, exe_path, current_ver, ctx)
 }
 
 fn process_tool_impl(
     tool: &ToolDef,
     exe_path: PathBuf,
     current_ver: Option<Version>,
-    install_dir: &Path,
-    client: &reqwest::blocking::Client,
-    dry_run: bool,
-    mp: &MultiProgress,
+    ctx: &UpdateCtx<'_>,
 ) -> Result<UpdateResult> {
     // ── Latest version ───────────────────────────────────────────────────────
-    let latest_str = fetch_latest_version(client, &tool.repo)?;
+    let (latest_str, assets) = fetch_latest_version(ctx.client, &tool.repo)?;
     let latest_ver = Version::parse(&latest_str)
         .with_context(|| format!("GitHub returned non-semver tag: {}", latest_str))?;
 
     // ── Dry run ──────────────────────────────────────────────────────────────
-    if dry_run {
+    if ctx.dry_run {
         return Ok(UpdateResult::DryRun {
             current: current_ver.map(|v| v.to_string()),
             latest: latest_ver.to_string(),
@@ -373,7 +375,8 @@ fn process_tool_impl(
     }
 
     // ── Up-to-date check ─────────────────────────────────────────────────────
-    if let Some(ref cur) = current_ver
+    if !ctx.force
+        && let Some(ref cur) = current_ver
         && *cur >= latest_ver
     {
         return Ok(UpdateResult::UpToDate(cur.to_string()));
@@ -381,10 +384,59 @@ fn process_tool_impl(
 
     // ── Download ─────────────────────────────────────────────────────────────
     let url = tool.download_url(&latest_str);
-    let asset_bytes = download_bytes(client, &url, mp)?;
+    let asset_bytes = download_bytes(ctx.client, &url, ctx.mp)?;
+
+    // ── Checksum verification ────────────────────────────────────────────────
+    let asset_name = tool.asset_name(&latest_str);
+
+    let checksum_asset = assets.iter().find(|a| {
+        let name = a.name.to_lowercase();
+        if name.ends_with(".sig") || name.ends_with(".asc") || name.ends_with(".pem") {
+            return false;
+        }
+        name == format!("{}.sha256", asset_name.to_lowercase())
+            || name == format!("{}.sha256sum", asset_name.to_lowercase())
+            || name == "checksums.txt"
+            || name == "sha256sums.txt"
+            || name == "sha256sums"
+            || name.contains("checksums")
+            || name.contains("sha256")
+    });
+
+    if let Some(checksum_asset) = checksum_asset {
+        let checksum_bytes =
+            download_bytes(ctx.client, &checksum_asset.browser_download_url, ctx.mp)
+                .with_context(|| format!("downloading checksum file '{}'", checksum_asset.name))?;
+        let checksum_text = String::from_utf8_lossy(&checksum_bytes);
+
+        let mut expected_hash = None;
+        for line in checksum_text.lines().filter(|l| l.contains(&asset_name)) {
+            if let Some(hash) = line.split_whitespace().next() {
+                expected_hash = Some(hash.to_lowercase());
+                break;
+            }
+        }
+
+        if let Some(expected) = expected_hash {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&asset_bytes);
+            let actual = hex::encode(hasher.finalize());
+            if actual != expected {
+                bail!(
+                    "checksum mismatch for {}: expected {}, got {}",
+                    asset_name,
+                    expected,
+                    actual
+                );
+            }
+        }
+    }
 
     // ── Extract or direct-write ───────────────────────────────────────────────
-    let tmp_path = install_dir.join(format!("{}.tmp", expand_template(&tool.exe_name, "")));
+    let tmp_path = ctx
+        .install_dir
+        .join(format!("{}.tmp", expand_template(&tool.exe_name, "")));
     match tool.archive_entry(&latest_str) {
         Some(archive_entry) => {
             if url.ends_with(".zip") {
@@ -416,7 +468,9 @@ fn process_tool_impl(
     // ── Atomic rename with Windows file-lock workaround ───────────────────────
     // On Windows a running executable cannot be deleted, but it *can* be renamed.
     // Move the old binary aside first so we can put the new one in its place.
-    let old_path = install_dir.join(format!("{}.old", expand_template(&tool.exe_name, "")));
+    let old_path = ctx
+        .install_dir
+        .join(format!("{}.old", expand_template(&tool.exe_name, "")));
     if exe_path.exists() {
         // Remove a previous leftover .old if present, ignoring errors.
         let _ = fs::remove_file(&old_path);
@@ -437,12 +491,7 @@ fn process_tool_impl(
     }
 }
 
-fn perform_self_update(
-    install_dir: &Path,
-    client: &reqwest::blocking::Client,
-    dry_run: bool,
-    mp: &MultiProgress,
-) -> Result<UpdateResult> {
+fn perform_self_update(ctx: &UpdateCtx<'_>) -> Result<UpdateResult> {
     let repo = get_own_repo();
     let exe_suffix = get_exe_suffix();
     let tool = ToolDef {
@@ -456,18 +505,10 @@ fn perform_self_update(
         archive_entry_template: Some(format!("clipdate{}", exe_suffix)),
     };
 
-    let exe_path = std::env::current_exe().unwrap_or_else(|_| install_dir.join(&tool.exe_name));
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| ctx.install_dir.join(&tool.exe_name));
     let current_ver = Version::parse(get_own_version()).ok();
 
-    process_tool_impl(
-        &tool,
-        exe_path,
-        current_ver,
-        install_dir,
-        client,
-        dry_run,
-        mp,
-    )
+    process_tool_impl(&tool, exe_path, current_ver, ctx)
 }
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
@@ -497,6 +538,10 @@ struct Cli {
     /// Show what would be updated without downloading anything.
     #[arg(long, short = 'n')]
     dry_run: bool,
+
+    /// Force update even if already up to date.
+    #[arg(long, short = 'f')]
+    force: bool,
 
     /// Update clipdate itself.
     #[arg(long)]
@@ -680,9 +725,17 @@ fn main() -> Result<()> {
 
     let mp = MultiProgress::new();
 
+    let ctx = UpdateCtx {
+        install_dir: &install_dir,
+        client: &client,
+        mp: &mp,
+        dry_run: cli.dry_run,
+        force: cli.force,
+    };
+
     if cli.self_update {
         let label = style("clipdate (self-update)").bold();
-        let result = perform_self_update(&install_dir, &client, cli.dry_run, &mp);
+        let result = perform_self_update(&ctx);
         if print_update_result(label, result) {
             std::process::exit(1);
         }
@@ -693,12 +746,7 @@ fn main() -> Result<()> {
     // Collect all results first so progress bars finish before we print summaries.
     let results: Vec<(&ToolDef, Result<UpdateResult>)> = tools
         .par_iter()
-        .map(|tool| {
-            (
-                *tool,
-                process_tool(tool, &install_dir, &client, cli.dry_run, &mp),
-            )
-        })
+        .map(|tool| (*tool, process_tool(tool, &ctx)))
         .collect();
 
     let errors: usize = results
