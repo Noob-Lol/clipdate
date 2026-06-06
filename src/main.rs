@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use semver::Version;
 use serde::Deserialize;
+use supports_unicode::Stream;
 use std::{
     fs,
     io::{self, Read},
@@ -196,6 +197,7 @@ fn download_bytes(
     client: &reqwest::blocking::Client,
     url: &str,
     mp: &MultiProgress,
+    no_unicode: bool,
 ) -> Result<Vec<u8>> {
     let mut resp = client
         .get(url)
@@ -214,15 +216,21 @@ fn download_bytes(
         .and_then(|s| s.parse::<u64>().ok());
 
     // Register with MultiProgress so concurrent bars don't overwrite each other.
+    let spinner_ticks: &[&str] = if no_unicode {
+        &["|", "/", "-", "\\", "|", "/", "-", "\\", " "]
+    } else {
+        &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    };
     let pb = if let Some(len) = content_len {
         let pb = mp.add(ProgressBar::new(len));
+        let fill_chars = if no_unicode { "=> " } else { "█▉▊▋▌▍▎▏ " };
         pb.set_style(
             ProgressStyle::with_template(
                 "  {spinner:.cyan} {msg}\n  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
             )
             .unwrap()
-            .progress_chars("█▉▊▋▌▍▎▏ ")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            .progress_chars(fill_chars)
+            .tick_strings(spinner_ticks),
         );
         pb
     } else {
@@ -230,7 +238,7 @@ fn download_bytes(
         pb.set_style(
             ProgressStyle::with_template("{spinner:.cyan} {msg} {bytes}")
                 .unwrap()
-                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                .tick_strings(spinner_ticks),
         );
         pb
     };
@@ -319,6 +327,7 @@ struct UpdateCtx<'a> {
     mp: &'a MultiProgress,
     dry_run: bool,
     force: bool,
+    no_unicode: bool,
 }
 
 #[derive(Debug)]
@@ -384,7 +393,7 @@ fn process_tool_impl(
 
     // ── Download ─────────────────────────────────────────────────────────────
     let url = tool.download_url(&latest_str);
-    let asset_bytes = download_bytes(ctx.client, &url, ctx.mp)?;
+    let asset_bytes = download_bytes(ctx.client, &url, ctx.mp, ctx.no_unicode)?;
 
     // ── Checksum verification ────────────────────────────────────────────────
     let asset_name = tool.asset_name(&latest_str);
@@ -405,7 +414,7 @@ fn process_tool_impl(
 
     if let Some(checksum_asset) = checksum_asset {
         let checksum_bytes =
-            download_bytes(ctx.client, &checksum_asset.browser_download_url, ctx.mp)
+            download_bytes(ctx.client, &checksum_asset.browser_download_url, ctx.mp, ctx.no_unicode)
                 .with_context(|| format!("downloading checksum file '{}'", checksum_asset.name))?;
         let checksum_text = String::from_utf8_lossy(&checksum_bytes);
 
@@ -546,6 +555,12 @@ struct Cli {
     /// Update clipdate itself.
     #[arg(long)]
     self_update: bool,
+
+    /// Use ASCII-only output (no Unicode symbols or Braille/block characters).
+    /// Auto-enabled when the terminal does not support Unicode
+    /// (e.g. legacy cmd.exe without chcp 65001, LANG=C containers, TERM=dumb).
+    #[arg(long)]
+    no_unicode: bool,
 }
 
 // ── Output helpers ───────────────────────────────────────────────────────────
@@ -553,43 +568,50 @@ struct Cli {
 /// Print the result of a single tool update and return `true` if it was an error.
 /// Both `self_update` and the parallel tool loop use identical formatting,
 /// so centralising it here eliminates the duplication.
-fn print_update_result(label: impl std::fmt::Display, result: Result<UpdateResult>) -> bool {
+fn print_update_result(
+    label: impl std::fmt::Display,
+    result: Result<UpdateResult>,
+    no_unicode: bool,
+) -> bool {
+    let sym = |u: &'static str, a: &'static str| if no_unicode { a } else { u };
     match result {
         Ok(UpdateResult::UpToDate(v)) => {
-            println!("{} {} up to date ({})", style("✓").green(), label, v);
+            println!("{} {} up to date ({})", style(sym("✓", "ok")).green(), label, v);
             false
         }
         Ok(UpdateResult::Updated { from, to }) => {
             println!(
-                "{} {} {} → {}",
-                style("↑").cyan(),
+                "{} {} {} {} {}",
+                style(sym("↑", "^")).cyan(),
                 label,
                 style(from).dim(),
+                sym("→", "->"),
                 style(to).green()
             );
             false
         }
         Ok(UpdateResult::Installed(v)) => {
-            println!("{} {} installed ({})", style("✓").green(), label, v);
+            println!("{} {} installed ({})", style(sym("✓", "ok")).green(), label, v);
             false
         }
         Ok(UpdateResult::DryRun { current, latest }) => {
             let cur_str = current.as_deref().unwrap_or("not installed");
             if current.as_deref() == Some(&latest) {
-                println!("{} {} up to date ({})", style("·").dim(), label, latest);
+                println!("{} {} up to date ({})", style(sym("·", ".")).dim(), label, latest);
             } else {
                 println!(
-                    "{} {} would update: {} → {}",
-                    style("→").yellow(),
+                    "{} {} would update: {} {} {}",
+                    style(sym("→", "->")).yellow(),
                     label,
                     style(cur_str).dim(),
+                    sym("→", "->"),
                     style(&latest).green()
                 );
             }
             false
         }
         Err(e) => {
-            eprintln!("{} {}: {:#}", style("✗").red(), label, e);
+            eprintln!("{} {}: {:#}", style(sym("✗", "x")).red(), label, e);
             true
         }
     }
@@ -725,18 +747,21 @@ fn main() -> Result<()> {
 
     let mp = MultiProgress::new();
 
+    let no_unicode = cli.no_unicode || !supports_unicode::on(Stream::Stdout);
+
     let ctx = UpdateCtx {
         install_dir: &install_dir,
         client: &client,
         mp: &mp,
         dry_run: cli.dry_run,
         force: cli.force,
+        no_unicode,
     };
 
     if cli.self_update {
         let label = style("clipdate (self-update)").bold();
         let result = perform_self_update(&ctx);
-        if print_update_result(label, result) {
+        if print_update_result(label, result, no_unicode) {
             std::process::exit(1);
         }
         return Ok(());
@@ -751,7 +776,7 @@ fn main() -> Result<()> {
 
     let errors: usize = results
         .into_iter()
-        .map(|(tool, result)| print_update_result(style(&tool.name).bold(), result) as usize)
+        .map(|(tool, result)| print_update_result(style(&tool.name).bold(), result, no_unicode) as usize)
         .sum();
 
     if errors > 0 {
