@@ -6,7 +6,6 @@ use rayon::prelude::*;
 use regex::Regex;
 use semver::Version;
 use serde::Deserialize;
-use supports_unicode::Stream;
 use std::{
     fs,
     io::{self, Read},
@@ -14,6 +13,7 @@ use std::{
     process::Command,
     time::Duration,
 };
+use supports_unicode::Stream;
 
 // ── Config file schema ───────────────────────────────────────────────────────
 
@@ -223,7 +223,11 @@ fn download_bytes(
     };
     let pb = if let Some(len) = content_len {
         let pb = mp.add(ProgressBar::new(len));
-        let fill_chars = if no_unicode { "=> " } else { "█▉▊▋▌▍▎▏ " };
+        let fill_chars = if no_unicode {
+            "=> "
+        } else {
+            "█▉▊▋▌▍▎▏ "
+        };
         pb.set_style(
             ProgressStyle::with_template(
                 "  {spinner:.cyan} {msg}\n  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
@@ -413,9 +417,13 @@ fn process_tool_impl(
     });
 
     if let Some(checksum_asset) = checksum_asset {
-        let checksum_bytes =
-            download_bytes(ctx.client, &checksum_asset.browser_download_url, ctx.mp, ctx.no_unicode)
-                .with_context(|| format!("downloading checksum file '{}'", checksum_asset.name))?;
+        let checksum_bytes = download_bytes(
+            ctx.client,
+            &checksum_asset.browser_download_url,
+            ctx.mp,
+            ctx.no_unicode,
+        )
+        .with_context(|| format!("downloading checksum file '{}'", checksum_asset.name))?;
         let checksum_text = String::from_utf8_lossy(&checksum_bytes);
 
         let mut expected_hash = None;
@@ -576,7 +584,12 @@ fn print_update_result(
     let sym = |u: &'static str, a: &'static str| if no_unicode { a } else { u };
     match result {
         Ok(UpdateResult::UpToDate(v)) => {
-            println!("{} {} up to date ({})", style(sym("✓", "ok")).green(), label, v);
+            println!(
+                "{} {} up to date ({})",
+                style(sym("✓", "ok")).green(),
+                label,
+                v
+            );
             false
         }
         Ok(UpdateResult::Updated { from, to }) => {
@@ -591,13 +604,23 @@ fn print_update_result(
             false
         }
         Ok(UpdateResult::Installed(v)) => {
-            println!("{} {} installed ({})", style(sym("✓", "ok")).green(), label, v);
+            println!(
+                "{} {} installed ({})",
+                style(sym("✓", "ok")).green(),
+                label,
+                v
+            );
             false
         }
         Ok(UpdateResult::DryRun { current, latest }) => {
             let cur_str = current.as_deref().unwrap_or("not installed");
             if current.as_deref() == Some(&latest) {
-                println!("{} {} up to date ({})", style(sym("·", ".")).dim(), label, latest);
+                println!(
+                    "{} {} up to date ({})",
+                    style(sym("·", ".")).dim(),
+                    label,
+                    latest
+                );
             } else {
                 println!(
                     "{} {} would update: {} {} {}",
@@ -776,7 +799,9 @@ fn main() -> Result<()> {
 
     let errors: usize = results
         .into_iter()
-        .map(|(tool, result)| print_update_result(style(&tool.name).bold(), result, no_unicode) as usize)
+        .map(|(tool, result)| {
+            print_update_result(style(&tool.name).bold(), result, no_unicode) as usize
+        })
         .sum();
 
     if errors > 0 {
