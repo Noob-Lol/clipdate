@@ -586,23 +586,23 @@ impl Glyphs {
     fn new(no_unicode: bool) -> Self {
         if no_unicode {
             Self {
-                ok:             "ok",
-                error:          "x",
-                updated:        "^",
-                arrow:          "->",
-                dot:            ".",
-                spinner:        &["|", "/", "-", "\\", "|", "/", "-", "\\", " "],
+                ok: "ok",
+                error: "x",
+                updated: "^",
+                arrow: "->",
+                dot: ".",
+                spinner: &["|", "/", "-", "\\", "|", "/", "-", "\\", " "],
                 progress_chars: "=> ",
             }
         } else {
             Self {
-                ok:             "\u{2713}",
-                error:          "\u{2717}",
-                updated:        "\u{2191}",
-                arrow:          "\u{2192}",
-                dot:            "\u{00b7}",
-                spinner:        &["\u{280b}", "\u{2819}", "\u{2839}", "\u{2838}", "\u{283c}", "\u{2834}", "\u{2826}", "\u{2827}", "\u{2807}", "\u{280f}"],
-                progress_chars: "\u{2588}\u{2589}\u{258a}\u{258b}\u{258c}\u{258d}\u{258e}\u{258f} ",
+                ok:             "✓",
+                error:          "✗",
+                updated:        "↑",
+                arrow:          "→",
+                dot:            "·",
+                spinner:        &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+                progress_chars: "█▉▊▋▌▍▎▏ ",
             }
         }
     }
