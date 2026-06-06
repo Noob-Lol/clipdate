@@ -29,6 +29,7 @@ flate2 = "1.1"
 rayon = "1"
 sha2 = "0.11"
 hex = "0.4"
+supports-unicode = "3"
 
 
 [profile.release]
