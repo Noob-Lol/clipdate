@@ -13,6 +13,7 @@ use std::{
     process::Command,
     time::Duration,
 };
+use supports_unicode::Stream;
 
 // ── Config file schema ───────────────────────────────────────────────────────
 
@@ -196,6 +197,7 @@ fn download_bytes(
     client: &reqwest::blocking::Client,
     url: &str,
     mp: &MultiProgress,
+    glyphs: &Glyphs,
 ) -> Result<Vec<u8>> {
     let mut resp = client
         .get(url)
@@ -221,8 +223,8 @@ fn download_bytes(
                 "  {spinner:.cyan} {msg}\n  [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})",
             )
             .unwrap()
-            .progress_chars("█▉▊▋▌▍▎▏ ")
-            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+            .progress_chars(glyphs.progress_chars)
+            .tick_strings(glyphs.spinner),
         );
         pb
     } else {
@@ -230,7 +232,7 @@ fn download_bytes(
         pb.set_style(
             ProgressStyle::with_template("{spinner:.cyan} {msg} {bytes}")
                 .unwrap()
-                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+                .tick_strings(glyphs.spinner),
         );
         pb
     };
@@ -319,6 +321,7 @@ struct UpdateCtx<'a> {
     mp: &'a MultiProgress,
     dry_run: bool,
     force: bool,
+    glyphs: &'a Glyphs,
 }
 
 #[derive(Debug)]
@@ -384,7 +387,7 @@ fn process_tool_impl(
 
     // ── Download ─────────────────────────────────────────────────────────────
     let url = tool.download_url(&latest_str);
-    let asset_bytes = download_bytes(ctx.client, &url, ctx.mp)?;
+    let asset_bytes = download_bytes(ctx.client, &url, ctx.mp, ctx.glyphs)?;
 
     // ── Checksum verification ────────────────────────────────────────────────
     let asset_name = tool.asset_name(&latest_str);
@@ -404,9 +407,13 @@ fn process_tool_impl(
     });
 
     if let Some(checksum_asset) = checksum_asset {
-        let checksum_bytes =
-            download_bytes(ctx.client, &checksum_asset.browser_download_url, ctx.mp)
-                .with_context(|| format!("downloading checksum file '{}'", checksum_asset.name))?;
+        let checksum_bytes = download_bytes(
+            ctx.client,
+            &checksum_asset.browser_download_url,
+            ctx.mp,
+            ctx.glyphs,
+        )
+        .with_context(|| format!("downloading checksum file '{}'", checksum_asset.name))?;
         let checksum_text = String::from_utf8_lossy(&checksum_bytes);
 
         let mut expected_hash = None;
@@ -546,6 +553,59 @@ struct Cli {
     /// Update clipdate itself.
     #[arg(long)]
     self_update: bool,
+
+    /// Use ASCII-only output (no Unicode symbols or Braille/block characters).
+    /// Auto-enabled when the terminal does not support Unicode
+    /// (e.g. legacy cmd.exe without chcp 65001, LANG=C containers, TERM=dumb).
+    #[arg(long)]
+    no_unicode: bool,
+}
+
+// ── Symbols ─────────────────────────────────────────────────────────────────
+
+/// All terminal symbols used in output, pre-selected for Unicode or ASCII mode.
+/// Construct once with [`Glyphs::new`] and pass around as a reference.
+struct Glyphs {
+    /// Success / up-to-date marker  (✓ / ok)
+    ok: &'static str,
+    /// Error marker                  (✗ / x)
+    error: &'static str,
+    /// "Updated from→to" prefix     (↑ / ^)
+    updated: &'static str,
+    /// Arrow between versions        (→ / ->)
+    arrow: &'static str,
+    /// Dry-run up-to-date marker     (· / .)
+    dot: &'static str,
+    /// Progress-bar spinner frames
+    spinner: &'static [&'static str],
+    /// Progress-bar fill characters
+    progress_chars: &'static str,
+}
+
+impl Glyphs {
+    fn new(no_unicode: bool) -> Self {
+        if no_unicode {
+            Self {
+                ok: "ok",
+                error: "x",
+                updated: "^",
+                arrow: "->",
+                dot: ".",
+                spinner: &["|", "/", "-", "\\", "|", "/", "-", "\\", " "],
+                progress_chars: "=> ",
+            }
+        } else {
+            Self {
+                ok: "✓",
+                error: "✗",
+                updated: "↑",
+                arrow: "→",
+                dot: "·",
+                spinner: &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+                progress_chars: "█▉▊▋▌▍▎▏ ",
+            }
+        }
+    }
 }
 
 // ── Output helpers ───────────────────────────────────────────────────────────
@@ -553,43 +613,49 @@ struct Cli {
 /// Print the result of a single tool update and return `true` if it was an error.
 /// Both `self_update` and the parallel tool loop use identical formatting,
 /// so centralising it here eliminates the duplication.
-fn print_update_result(label: impl std::fmt::Display, result: Result<UpdateResult>) -> bool {
+fn print_update_result(
+    label: impl std::fmt::Display,
+    result: Result<UpdateResult>,
+    g: &Glyphs,
+) -> bool {
     match result {
         Ok(UpdateResult::UpToDate(v)) => {
-            println!("{} {} up to date ({})", style("✓").green(), label, v);
+            println!("{} {} up to date ({})", style(g.ok).green(), label, v);
             false
         }
         Ok(UpdateResult::Updated { from, to }) => {
             println!(
-                "{} {} {} → {}",
-                style("↑").cyan(),
+                "{} {} {} {} {}",
+                style(g.updated).cyan(),
                 label,
                 style(from).dim(),
+                g.arrow,
                 style(to).green()
             );
             false
         }
         Ok(UpdateResult::Installed(v)) => {
-            println!("{} {} installed ({})", style("✓").green(), label, v);
+            println!("{} {} installed ({})", style(g.ok).green(), label, v);
             false
         }
         Ok(UpdateResult::DryRun { current, latest }) => {
             let cur_str = current.as_deref().unwrap_or("not installed");
             if current.as_deref() == Some(&latest) {
-                println!("{} {} up to date ({})", style("·").dim(), label, latest);
+                println!("{} {} up to date ({})", style(g.dot).dim(), label, latest);
             } else {
                 println!(
-                    "{} {} would update: {} → {}",
-                    style("→").yellow(),
+                    "{} {} would update: {} {} {}",
+                    style(g.arrow).yellow(),
                     label,
                     style(cur_str).dim(),
+                    g.arrow,
                     style(&latest).green()
                 );
             }
             false
         }
         Err(e) => {
-            eprintln!("{} {}: {:#}", style("✗").red(), label, e);
+            eprintln!("{} {}: {:#}", style(g.error).red(), label, e);
             true
         }
     }
@@ -725,18 +791,21 @@ fn main() -> Result<()> {
 
     let mp = MultiProgress::new();
 
+    let glyphs = Glyphs::new(cli.no_unicode || !supports_unicode::on(Stream::Stdout));
+
     let ctx = UpdateCtx {
         install_dir: &install_dir,
         client: &client,
         mp: &mp,
         dry_run: cli.dry_run,
         force: cli.force,
+        glyphs: &glyphs,
     };
 
     if cli.self_update {
         let label = style("clipdate (self-update)").bold();
         let result = perform_self_update(&ctx);
-        if print_update_result(label, result) {
+        if print_update_result(label, result, &glyphs) {
             std::process::exit(1);
         }
         return Ok(());
@@ -751,7 +820,9 @@ fn main() -> Result<()> {
 
     let errors: usize = results
         .into_iter()
-        .map(|(tool, result)| print_update_result(style(&tool.name).bold(), result) as usize)
+        .map(|(tool, result)| {
+            print_update_result(style(&tool.name).bold(), result, &glyphs) as usize
+        })
         .sum();
 
     if errors > 0 {
