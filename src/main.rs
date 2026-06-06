@@ -596,12 +596,12 @@ impl Glyphs {
             }
         } else {
             Self {
-                ok:             "✓",
-                error:          "✗",
-                updated:        "↑",
-                arrow:          "→",
-                dot:            "·",
-                spinner:        &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+                ok: "✓",
+                error: "✗",
+                updated: "↑",
+                arrow: "→",
+                dot: "·",
+                spinner: &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
                 progress_chars: "█▉▊▋▌▍▎▏ ",
             }
         }
