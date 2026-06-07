@@ -1,0 +1,7 @@
+# clipdate settings — copy to clipdate.toml and place next to the binary.
+# All fields are optional. CLI flags and environment variables take priority.
+
+# install_dir = "C:\\tools\\bin"     # where managed tools are installed
+# token       = "ghp_..."            # GitHub PAT for higher API rate limits
+# no_unicode  = false                # true = force ASCII-only output
+# tools_config = "C:\\tools\\tools.json"  # path to tools.json if non-standard

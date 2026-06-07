@@ -559,6 +559,11 @@ struct Cli {
     /// (e.g. legacy cmd.exe without chcp 65001, LANG=C containers, TERM=dumb).
     #[arg(long)]
     no_unicode: bool,
+
+    /// Path to the settings TOML file (default: clipdate.toml next to the binary).
+    /// Can also be set via the CLIPDATE_SETTINGS environment variable.
+    #[arg(long, env = "CLIPDATE_SETTINGS")]
+    settings: Option<PathBuf>,
 }
 
 // ── Symbols ─────────────────────────────────────────────────────────────────
@@ -735,15 +740,91 @@ fn clean_old_files(install_dir: &Path) {
     }
 }
 
-fn default_config_path() -> PathBuf {
+fn next_to_exe(file: &str) -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|d| d.join("tools.json")))
-        .unwrap_or_else(|| PathBuf::from("tools.json"))
+        .and_then(|p| p.parent().map(|d| d.join(file)))
+}
+
+fn default_config_path() -> PathBuf {
+    next_to_exe("tools.json").unwrap_or_else(|| PathBuf::from("tools.json"))
+}
+
+// ── Settings file ────────────────────────────────────────────────────────────
+
+/// Persistent settings loaded from `clipdate.toml`.
+///
+/// All fields are optional; absent fields leave the corresponding CLI default
+/// untouched. CLI flags and environment variables always take priority.
+#[derive(Debug, Default, Deserialize)]
+struct AppConfig {
+    /// Override the install directory (same as `--install-dir` / `CLIPDATE_BIN_DIR`).
+    install_dir: Option<PathBuf>,
+
+    /// GitHub PAT for higher API rate limits (same as `--token` / `GITHUB_TOKEN`).
+    token: Option<String>,
+
+    /// `true` = always use ASCII-only output (same as `--no-unicode`).
+    /// `false` or absent = let the runtime Unicode-capability check decide.
+    no_unicode: Option<bool>,
+
+    /// Path to the tools JSON file (same as `--config` / `CLIPDATE_CONFIG`).
+    tools_config: Option<PathBuf>,
+}
+
+/// Load `clipdate.toml` from `override_path` if given, otherwise look for one
+/// next to the binary. Returns `AppConfig::default()` if no file is found.
+/// Returns an error if a file is found but cannot be parsed.
+fn load_app_config(override_path: Option<&Path>) -> Result<AppConfig> {
+    let path: Option<PathBuf> = if let Some(p) = override_path {
+        // Explicit --settings: the file must exist.
+        if !p.exists() {
+            bail!("settings file not found: {}", p.display());
+        }
+        Some(p.to_path_buf())
+    } else {
+        // Optional: next to the binary.
+        next_to_exe("clipdate.toml").filter(|p| p.exists())
+    };
+
+    let Some(path) = path else {
+        return Ok(AppConfig::default());
+    };
+
+    let text = fs::read_to_string(&path)
+        .with_context(|| format!("reading settings: {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing settings: {}", path.display()))
+}
+
+/// Fill any `None`/`false` fields on `cli` from the settings file.
+///
+/// This is called once right after `Cli::parse()`. Because clap already folds
+/// environment variables into `cli.*`, the effective priority is:
+/// CLI flag > env var > clipdate.toml > built-in default.
+fn apply_settings_to_cli(cli: &mut Cli) -> Result<()> {
+    let cfg = load_app_config(cli.settings.as_deref())?;
+
+    if cli.install_dir.is_none() {
+        cli.install_dir = cfg.install_dir;
+    }
+    if cli.token.is_none() {
+        cli.token = cfg.token;
+    }
+    // `no_unicode` is a bool flag; the config can only force it on.
+    // It cannot suppress the runtime supports_unicode check.
+    if !cli.no_unicode {
+        cli.no_unicode = cfg.no_unicode.unwrap_or(false);
+    }
+    if cli.config.is_none() {
+        cli.config = cfg.tools_config;
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    apply_settings_to_cli(&mut cli)?;
 
     // ── Load config ──────────────────────────────────────────────────────────
     let config_path = cli.config.unwrap_or_else(default_config_path);
@@ -907,5 +988,86 @@ mod tests {
         let json = include_str!("../tools.json");
         let tools: Vec<ToolDef> = serde_json::from_str(json).unwrap();
         assert!(tools[0].archive_entry_template.is_some());
+    }
+
+    #[test]
+    fn test_app_config_deserialisation() {
+        let toml = r#"
+            install_dir  = "/usr/local/bin"
+            token        = "ghp_test"
+            no_unicode   = true
+            tools_config = "/etc/clipdate/tools.json"
+        "#;
+        let cfg: AppConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.install_dir.as_deref(),
+            Some(std::path::Path::new("/usr/local/bin"))
+        );
+        assert_eq!(cfg.token.as_deref(), Some("ghp_test"));
+        assert_eq!(cfg.no_unicode, Some(true));
+        assert_eq!(
+            cfg.tools_config.as_deref(),
+            Some(std::path::Path::new("/etc/clipdate/tools.json"))
+        );
+    }
+
+    #[test]
+    fn test_app_config_empty() {
+        // Empty TOML should deserialise to all-None defaults.
+        let cfg: AppConfig = toml::from_str("").unwrap();
+        assert!(cfg.install_dir.is_none());
+        assert!(cfg.token.is_none());
+        assert!(cfg.no_unicode.is_none());
+        assert!(cfg.tools_config.is_none());
+    }
+
+    #[test]
+    fn test_apply_settings_cli_wins() {
+        // CLI-set fields must not be overwritten by config values.
+        let cfg = AppConfig {
+            install_dir: Some(PathBuf::from("/from/config")),
+            token: Some("config_token".to_string()),
+            no_unicode: Some(true),
+            tools_config: Some(PathBuf::from("/from/config/tools.json")),
+        };
+
+        let mut cli = Cli {
+            tools: vec![],
+            config: Some(PathBuf::from("/from/cli/tools.json")),
+            install_dir: Some(PathBuf::from("/from/cli")),
+            token: Some("cli_token".to_string()),
+            dry_run: false,
+            force: false,
+            self_update: false,
+            no_unicode: false, // CLI left it false; config says true
+            settings: None,
+        };
+
+        // Manually apply (mirrors apply_settings_to_cli without the file I/O).
+        if cli.install_dir.is_none() {
+            cli.install_dir = cfg.install_dir;
+        }
+        if cli.token.is_none() {
+            cli.token = cfg.token;
+        }
+        if !cli.no_unicode {
+            cli.no_unicode = cfg.no_unicode.unwrap_or(false);
+        }
+        if cli.config.is_none() {
+            cli.config = cfg.tools_config;
+        }
+
+        // CLI values should be preserved.
+        assert_eq!(
+            cli.install_dir.as_deref(),
+            Some(std::path::Path::new("/from/cli"))
+        );
+        assert_eq!(cli.token.as_deref(), Some("cli_token"));
+        assert_eq!(
+            cli.config.as_deref(),
+            Some(std::path::Path::new("/from/cli/tools.json"))
+        );
+        // no_unicode was false on CLI, config had true → config wins here (expected).
+        assert!(cli.no_unicode);
     }
 }

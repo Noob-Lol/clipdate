@@ -187,6 +187,7 @@ dependencies = [
  "sha2",
  "supports-unicode",
  "tar",
+ "toml",
  "winresource",
  "zip",
 ]
