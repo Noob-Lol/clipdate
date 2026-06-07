@@ -1,5 +1,5 @@
 sign-commit = true
 sign-tag = true
 tag-name = "v{{version}}"
-pre-release-commit-message = "chore: release {{crate_name}} v{{version}}"
+pre-release-commit-message = "chore: release {{crate_name}} v{{version}} [skip ci]"
 publish = false   # don't push to crates.io
