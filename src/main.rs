@@ -379,20 +379,35 @@ fn process_tool_impl(
     let os_list = get_os_list(ctx.app_config);
     let arch_list = get_arch_list(ctx.app_config);
 
-    let (url, asset_name, matched_os, matched_arch) = if let Some(m) = os_list.iter().find_map(|os| {
-        arch_list.iter().find_map(|arch| {
-            let cand = expand_template_with_os_arch(&tool.asset_template, &latest_str, os, arch);
-            assets.iter()
-                .find(|a| a.name.eq_ignore_ascii_case(&cand))
-                .map(|a| (a.browser_download_url.clone(), a.name.clone(), os.clone(), arch.clone()))
-        })
-    }) {
+    let (url, asset_name, matched_os, matched_arch) = if let Some(m) =
+        os_list.iter().find_map(|os| {
+            arch_list.iter().find_map(|arch| {
+                let cand =
+                    expand_template_with_os_arch(&tool.asset_template, &latest_str, os, arch);
+                assets
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&cand))
+                    .map(|a| {
+                        (
+                            a.browser_download_url.clone(),
+                            a.name.clone(),
+                            os.clone(),
+                            arch.clone(),
+                        )
+                    })
+            })
+        }) {
         m
     } else {
         // Fallback to default template expansion
         let default_os = get_os();
         let default_arch = get_arch();
-        let default_name = expand_template_with_os_arch(&tool.asset_template, &latest_str, default_os, default_arch);
+        let default_name = expand_template_with_os_arch(
+            &tool.asset_template,
+            &latest_str,
+            default_os,
+            default_arch,
+        );
         (
             format!(
                 "https://github.com/{}/releases/download/v{}/{}",
@@ -725,11 +740,8 @@ fn build_client(token: Option<&str>) -> Result<reqwest::blocking::Client> {
     let mut headers = HeaderMap::new();
 
     let repo = get_own_repo();
-    let user_agent = format!(
-        "clipdate/{} (https://github.com/{})",
-        get_own_version(),
-        repo
-    );
+    let version = get_own_version();
+    let user_agent = format!("clipdate/{} (https://github.com/{})", version, repo);
 
     headers.insert(
         USER_AGENT,
@@ -1040,14 +1052,20 @@ fn detect_asset_template(
         .iter()
         .find_map(|asset| {
             let lower = asset.name.to_lowercase();
-            let os = os_list.iter().find(|os| lower.contains(&os.to_lowercase()))?;
-            let arch = arch_list.iter().find(|a| lower.contains(&a.to_lowercase()))?;
+            let os = os_list
+                .iter()
+                .find(|os| lower.contains(&os.to_lowercase()))?;
+            let arch = arch_list
+                .iter()
+                .find(|a| lower.contains(&a.to_lowercase()))?;
             Some((&asset.name, Some(os.clone()), Some(arch.clone())))
         })
         .or_else(|| {
             assets.iter().find_map(|asset| {
                 let lower = asset.name.to_lowercase();
-                let os = os_list.iter().find(|os| lower.contains(&os.to_lowercase()))?;
+                let os = os_list
+                    .iter()
+                    .find(|os| lower.contains(&os.to_lowercase()))?;
                 Some((&asset.name, Some(os.clone()), None::<String>))
             })
         })?;
@@ -1062,13 +1080,19 @@ fn detect_asset_template(
     }
 
     if let Some((os, idx)) = matched_os.as_ref().and_then(|os| {
-        template.to_lowercase().find(&os.to_lowercase()).map(|i| (os, i))
+        template
+            .to_lowercase()
+            .find(&os.to_lowercase())
+            .map(|i| (os, i))
     }) {
         template.replace_range(idx..idx + os.len(), "{OS}");
     }
 
     if let Some((arch, idx)) = matched_arch.as_ref().and_then(|arch| {
-        template.to_lowercase().find(&arch.to_lowercase()).map(|i| (arch, i))
+        template
+            .to_lowercase()
+            .find(&arch.to_lowercase())
+            .map(|i| (arch, i))
     }) {
         template.replace_range(idx..idx + arch.len(), "{ARCH}");
     }
