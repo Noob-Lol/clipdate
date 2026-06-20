@@ -379,37 +379,20 @@ fn process_tool_impl(
     let os_list = get_os_list(ctx.app_config);
     let arch_list = get_arch_list(ctx.app_config);
 
-    let mut matched = None;
-    for os in &os_list {
-        for arch in &arch_list {
+    let (url, asset_name, matched_os, matched_arch) = if let Some(m) = os_list.iter().find_map(|os| {
+        arch_list.iter().find_map(|arch| {
             let cand = expand_template_with_os_arch(&tool.asset_template, &latest_str, os, arch);
-            if let Some(asset) = assets.iter().find(|a| a.name.eq_ignore_ascii_case(&cand)) {
-                matched = Some((
-                    asset.browser_download_url.clone(),
-                    asset.name.clone(),
-                    os.clone(),
-                    arch.clone(),
-                ));
-                break;
-            }
-        }
-        if matched.is_some() {
-            break;
-        }
-    }
-
-    let (url, asset_name, matched_os, matched_arch) = if let Some(m) = matched {
+            assets.iter()
+                .find(|a| a.name.eq_ignore_ascii_case(&cand))
+                .map(|a| (a.browser_download_url.clone(), a.name.clone(), os.clone(), arch.clone()))
+        })
+    }) {
         m
     } else {
         // Fallback to default template expansion
         let default_os = get_os();
         let default_arch = get_arch();
-        let default_name = expand_template_with_os_arch(
-            &tool.asset_template,
-            &latest_str,
-            default_os,
-            default_arch,
-        );
+        let default_name = expand_template_with_os_arch(&tool.asset_template, &latest_str, default_os, default_arch);
         (
             format!(
                 "https://github.com/{}/releases/download/v{}/{}",
@@ -848,56 +831,30 @@ struct AppConfig {
 
 fn get_os_list(config: &AppConfig) -> Vec<String> {
     let os = std::env::consts::OS;
-    if let Some(list) = config.os_map.get(os) {
-        if !list.is_empty() {
-            return list.clone();
-        }
+    if let Some(list) = config.os_map.get(os).filter(|l| !l.is_empty()) {
+        return list.clone();
     }
-    match os {
-        "macos" => vec![
-            "darwin".to_string(),
-            "macos".to_string(),
-            "osx".to_string(),
-            "apple-darwin".to_string(),
-        ],
-        "windows" => vec![
-            "windows".to_string(),
-            "win".to_string(),
-            "win64".to_string(),
-            "pc-windows-msvc".to_string(),
-        ],
-        "linux" => vec![
-            "linux".to_string(),
-            "linux-gnu".to_string(),
-            "unknown-linux-gnu".to_string(),
-        ],
-        other => vec![other.to_string()],
-    }
+    let defaults = match os {
+        "macos" => &["darwin", "macos", "osx", "apple-darwin"][..],
+        "windows" => &["windows", "win", "win64", "pc-windows-msvc"],
+        "linux" => &["linux", "linux-gnu", "unknown-linux-gnu"],
+        other => &[other],
+    };
+    defaults.iter().map(|&s| s.to_string()).collect()
 }
 
 fn get_arch_list(config: &AppConfig) -> Vec<String> {
     let arch = std::env::consts::ARCH;
-    if let Some(list) = config.arch_map.get(arch) {
-        if !list.is_empty() {
-            return list.clone();
-        }
+    if let Some(list) = config.arch_map.get(arch).filter(|l| !l.is_empty()) {
+        return list.clone();
     }
-    match arch {
-        "x86_64" => vec![
-            "amd64".to_string(),
-            "x86_64".to_string(),
-            "x64".to_string(),
-            "64bit".to_string(),
-        ],
-        "aarch64" => vec!["arm64".to_string(), "aarch64".to_string()],
-        "i386" => vec![
-            "386".to_string(),
-            "i386".to_string(),
-            "x86".to_string(),
-            "32bit".to_string(),
-        ],
-        other => vec![other.to_string()],
-    }
+    let defaults = match arch {
+        "x86_64" => &["amd64", "x86_64", "x64", "64bit"][..],
+        "aarch64" => &["arm64", "aarch64"],
+        "i386" => &["386", "i386", "x86", "32bit"],
+        other => &[other],
+    };
+    defaults.iter().map(|&s| s.to_string()).collect()
 }
 
 /// Load `clipdate.toml` from `override_path` if given, otherwise look for one
@@ -1078,42 +1035,23 @@ fn detect_asset_template(
     os_list: &[String],
     arch_list: &[String],
 ) -> Option<(String, Option<String>)> {
-    let mut matched_asset = None;
-    let mut matched_os = None;
-    let mut matched_arch = None;
+    // First try to match both OS and arch; fall back to OS-only.
+    let (asset_name, matched_os, matched_arch) = assets
+        .iter()
+        .find_map(|asset| {
+            let lower = asset.name.to_lowercase();
+            let os = os_list.iter().find(|os| lower.contains(&os.to_lowercase()))?;
+            let arch = arch_list.iter().find(|a| lower.contains(&a.to_lowercase()))?;
+            Some((&asset.name, Some(os.clone()), Some(arch.clone())))
+        })
+        .or_else(|| {
+            assets.iter().find_map(|asset| {
+                let lower = asset.name.to_lowercase();
+                let os = os_list.iter().find(|os| lower.contains(&os.to_lowercase()))?;
+                Some((&asset.name, Some(os.clone()), None::<String>))
+            })
+        })?;
 
-    for asset in assets {
-        let name_lower = asset.name.to_lowercase();
-        let os_opt = os_list
-            .iter()
-            .find(|os| name_lower.contains(&os.to_lowercase()));
-        let arch_opt = arch_list
-            .iter()
-            .find(|arch| name_lower.contains(&arch.to_lowercase()));
-
-        if let (Some(os), Some(arch)) = (os_opt, arch_opt) {
-            matched_asset = Some(&asset.name);
-            matched_os = Some(os.clone());
-            matched_arch = Some(arch.clone());
-            break;
-        }
-    }
-
-    if matched_asset.is_none() {
-        for asset in assets {
-            let name_lower = asset.name.to_lowercase();
-            let os_opt = os_list
-                .iter()
-                .find(|os| name_lower.contains(&os.to_lowercase()));
-            if let Some(os) = os_opt {
-                matched_asset = Some(&asset.name);
-                matched_os = Some(os.clone());
-                break;
-            }
-        }
-    }
-
-    let asset_name = matched_asset?;
     let mut template = asset_name.clone();
 
     let v_with_prefix = format!("v{}", latest_str);
@@ -1123,21 +1061,20 @@ fn detect_asset_template(
         template = template.replace(latest_str, "{VERSION}");
     }
 
-    if let Some(ref os) = matched_os {
-        if let Some(idx) = template.to_lowercase().find(&os.to_lowercase()) {
-            template.replace_range(idx..idx + os.len(), "{OS}");
-        }
+    if let Some((os, idx)) = matched_os.as_ref().and_then(|os| {
+        template.to_lowercase().find(&os.to_lowercase()).map(|i| (os, i))
+    }) {
+        template.replace_range(idx..idx + os.len(), "{OS}");
     }
 
-    if let Some(ref arch) = matched_arch {
-        if let Some(idx) = template.to_lowercase().find(&arch.to_lowercase()) {
-            template.replace_range(idx..idx + arch.len(), "{ARCH}");
-        }
+    if let Some((arch, idx)) = matched_arch.as_ref().and_then(|arch| {
+        template.to_lowercase().find(&arch.to_lowercase()).map(|i| (arch, i))
+    }) {
+        template.replace_range(idx..idx + arch.len(), "{ARCH}");
     }
 
     let mut is_archive = false;
-    let archive_exts = [".zip", ".tar.gz", ".tgz"];
-    for ext in &archive_exts {
+    for ext in &[".zip", ".tar.gz", ".tgz"] {
         if template.to_lowercase().ends_with(ext) {
             is_archive = true;
             let idx = template.len() - ext.len();
@@ -1170,7 +1107,7 @@ fn handle_add_command(
 ) -> Result<()> {
     let name = name_opt.unwrap_or_else(|| {
         repo.split('/')
-            .last()
+            .next_back()
             .unwrap_or(repo)
             .trim_start_matches("cli-")
             .trim_end_matches("-cli")
