@@ -5,10 +5,11 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use regex::Regex;
 use semver::Version;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     fs,
-    io::{self, Read},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -25,7 +26,7 @@ use supports_unicode::Stream;
 /// ```
 ///
 /// Template variables: {VERSION} is replaced with the resolved latest semver string.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ToolDef {
     /// Display name, also used to match CLI arguments.
     name: String,
@@ -49,7 +50,7 @@ struct ToolDef {
     /// Path of the entry *inside* the archive that should be extracted, e.g. `"koyeb.exe"` or
     /// `"cli_{VERSION}.exe"`.
     /// If not specified, the asset itself is assumed to be a raw executable file.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     archive_entry_template: Option<String>,
 }
 
@@ -91,35 +92,34 @@ fn get_archive_ext() -> &'static str {
     if cfg!(windows) { "zip" } else { "tar.gz" }
 }
 
-fn expand_template(template: &str, version: &str) -> String {
+/// Returns `true` if `token` appears as a whole word inside `name`, where words
+/// are delimited by `-`, `_`, `.`, or the string boundaries.
+/// This prevents "win" from matching inside "darwin" (dar**win**).
+fn name_has_token(name: &str, token: &str) -> bool {
+    let name_lc = name.to_lowercase();
+    let token_lc = token.to_lowercase();
+    name_lc
+        .split(['-', '_', '.'])
+        .any(|part| part == token_lc)
+}
+
+fn expand_template_with_os_arch(template: &str, version: &str, os: &str, arch: &str) -> String {
     template
         .replace("{VERSION}", version)
-        .replace("{OS}", get_os())
-        .replace("{ARCH}", get_arch())
+        .replace("{OS}", os)
+        .replace("{ARCH}", arch)
         .replace("{TARGET}", get_target())
         .replace("{EXE}", get_exe_suffix())
         .replace("{EXT}", get_archive_ext())
 }
 
-impl ToolDef {
-    fn asset_name(&self, version: &str) -> String {
-        expand_template(&self.asset_template, version)
+fn expand_exe_template(template: &str, version: &str, os: &str, arch: &str) -> String {
+    let mut s = expand_template_with_os_arch(template, version, os, arch);
+    let suffix = get_exe_suffix();
+    if !suffix.is_empty() && !s.ends_with(suffix) && !s.contains("{EXE}") {
+        s.push_str(suffix);
     }
-
-    fn archive_entry(&self, version: &str) -> Option<String> {
-        self.archive_entry_template
-            .as_ref()
-            .map(|t| expand_template(t, version))
-    }
-
-    fn download_url(&self, version: &str) -> String {
-        format!(
-            "https://github.com/{}/releases/download/v{}/{}",
-            self.repo,
-            version,
-            self.asset_name(version)
-        )
-    }
+    s
 }
 
 // ── GitHub API ───────────────────────────────────────────────────────────────
@@ -322,6 +322,7 @@ struct UpdateCtx<'a> {
     dry_run: bool,
     force: bool,
     glyphs: &'a Glyphs,
+    app_config: &'a AppConfig,
 }
 
 #[derive(Debug)]
@@ -339,7 +340,7 @@ enum UpdateResult {
 }
 
 fn process_tool(tool: &ToolDef, ctx: &UpdateCtx<'_>) -> Result<UpdateResult> {
-    let exe_name = expand_template(&tool.exe_name, "");
+    let exe_name = expand_exe_template(&tool.exe_name, "", get_os(), get_arch());
     let exe_path = ctx.install_dir.join(&exe_name);
 
     // ── Compile version regex once per tool ──────────────────────────────────
@@ -385,13 +386,54 @@ fn process_tool_impl(
         return Ok(UpdateResult::UpToDate(cur.to_string()));
     }
 
+    // ── OS/Arch fallback matching ───────────────────────────────────────────
+    let os_list = get_os_list(ctx.app_config);
+    let arch_list = get_arch_list(ctx.app_config);
+
+    let (url, asset_name, matched_os, matched_arch) = if let Some(m) =
+        os_list.iter().find_map(|os| {
+            arch_list.iter().find_map(|arch| {
+                let cand =
+                    expand_template_with_os_arch(&tool.asset_template, &latest_str, os, arch);
+                assets
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(&cand))
+                    .map(|a| {
+                        (
+                            a.browser_download_url.clone(),
+                            a.name.clone(),
+                            os.clone(),
+                            arch.clone(),
+                        )
+                    })
+            })
+        }) {
+        m
+    } else {
+        // Fallback to default template expansion
+        let default_os = get_os();
+        let default_arch = get_arch();
+        let default_name = expand_template_with_os_arch(
+            &tool.asset_template,
+            &latest_str,
+            default_os,
+            default_arch,
+        );
+        (
+            format!(
+                "https://github.com/{}/releases/download/v{}/{}",
+                tool.repo, latest_str, default_name
+            ),
+            default_name,
+            default_os.to_string(),
+            default_arch.to_string(),
+        )
+    };
+
     // ── Download ─────────────────────────────────────────────────────────────
-    let url = tool.download_url(&latest_str);
     let asset_bytes = download_bytes(ctx.client, &url, ctx.mp, ctx.glyphs)?;
 
     // ── Checksum verification ────────────────────────────────────────────────
-    let asset_name = tool.asset_name(&latest_str);
-
     let checksum_asset = assets.iter().find(|a| {
         let name = a.name.to_lowercase();
         if name.ends_with(".sig") || name.ends_with(".asc") || name.ends_with(".pem") {
@@ -441,16 +483,24 @@ fn process_tool_impl(
     }
 
     // ── Extract or direct-write ───────────────────────────────────────────────
-    let tmp_path = ctx
-        .install_dir
-        .join(format!("{}.tmp", expand_template(&tool.exe_name, "")));
-    match tool.archive_entry(&latest_str) {
-        Some(archive_entry) => {
+    let exe_file_name = exe_path
+        .file_name()
+        .ok_or_else(|| anyhow!("invalid exe path: {}", exe_path.display()))?
+        .to_string_lossy();
+    let tmp_path = ctx.install_dir.join(format!("{}.tmp", exe_file_name));
+
+    let archive_entry = tool
+        .archive_entry_template
+        .as_ref()
+        .map(|t| expand_exe_template(t, &latest_str, &matched_os, &matched_arch));
+
+    match archive_entry {
+        Some(ref archive_entry) => {
             if url.ends_with(".zip") {
-                extract_entry(&asset_bytes, &archive_entry, &tmp_path)
+                extract_entry(&asset_bytes, archive_entry, &tmp_path)
                     .with_context(|| format!("extracting '{}' from zip", archive_entry))?;
             } else if url.ends_with(".tar.gz") || url.ends_with(".tgz") {
-                extract_tar_gz(&asset_bytes, &archive_entry, &tmp_path)
+                extract_tar_gz(&asset_bytes, archive_entry, &tmp_path)
                     .with_context(|| format!("extracting '{}' from tar.gz", archive_entry))?;
             } else {
                 bail!("unsupported archive format for URL: {}", url);
@@ -475,9 +525,7 @@ fn process_tool_impl(
     // ── Atomic rename with Windows file-lock workaround ───────────────────────
     // On Windows a running executable cannot be deleted, but it *can* be renamed.
     // Move the old binary aside first so we can put the new one in its place.
-    let old_path = ctx
-        .install_dir
-        .join(format!("{}.old", expand_template(&tool.exe_name, "")));
+    let old_path = ctx.install_dir.join(format!("{}.old", exe_file_name));
     if exe_path.exists() {
         // Remove a previous leftover .old if present, ignoring errors.
         let _ = fs::remove_file(&old_path);
@@ -500,19 +548,20 @@ fn process_tool_impl(
 
 fn perform_self_update(ctx: &UpdateCtx<'_>) -> Result<UpdateResult> {
     let repo = get_own_repo();
-    let exe_suffix = get_exe_suffix();
     let tool = ToolDef {
         name: "clipdate".to_string(),
-        exe_name: format!("clipdate{}", exe_suffix),
+        exe_name: "clipdate".to_string(),
         version_args: vec![],
         version_regex: "".to_string(),
         repo: repo.to_string(),
         // our names are Go style, <binary>_<version>_<os>_<arch>.<ext>, basically {NAME}_{VERSION}_{OS}_{ARCH}.{EXT}
         asset_template: "clipdate_{VERSION}_{OS}_{ARCH}.{EXT}".to_string(),
-        archive_entry_template: Some(format!("clipdate{}", exe_suffix)),
+        archive_entry_template: Some("clipdate".to_string()),
     };
 
-    let exe_path = std::env::current_exe().unwrap_or_else(|_| ctx.install_dir.join(&tool.exe_name));
+    let resolved_exe_name = expand_exe_template(&tool.exe_name, "", get_os(), get_arch());
+    let exe_path =
+        std::env::current_exe().unwrap_or_else(|_| ctx.install_dir.join(&resolved_exe_name));
     let current_ver = Version::parse(get_own_version()).ok();
 
     process_tool_impl(&tool, exe_path, current_ver, ctx)
@@ -564,6 +613,34 @@ struct Cli {
     /// Can also be set via the CLIPDATE_SETTINGS environment variable.
     #[arg(long, env = "CLIPDATE_SETTINGS")]
     settings: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Commands>,
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+enum Commands {
+    /// Add a new tool to tools.json
+    Add {
+        /// GitHub repository in "owner/repo" format.
+        repo: String,
+
+        /// Optional name of the tool (defaults to the repository name)
+        #[arg(long, short)]
+        name: Option<String>,
+
+        /// Optional executable name (defaults to "name")
+        #[arg(long)]
+        exe: Option<String>,
+
+        /// Optional asset template (will be auto-detected if not provided)
+        #[arg(long)]
+        asset: Option<String>,
+
+        /// Skip prompt confirmation
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 // ── Symbols ─────────────────────────────────────────────────────────────────
@@ -674,11 +751,8 @@ fn build_client(token: Option<&str>) -> Result<reqwest::blocking::Client> {
     let mut headers = HeaderMap::new();
 
     let repo = get_own_repo();
-    let user_agent = format!(
-        "clipdate/{} (https://github.com/{})",
-        get_own_version(),
-        repo
-    );
+    let version = get_own_version();
+    let user_agent = format!("clipdate/{} (https://github.com/{})", version, repo);
 
     headers.insert(
         USER_AGENT,
@@ -770,6 +844,40 @@ struct AppConfig {
 
     /// Path to the tools JSON file (same as `--config` / `CLIPDATE_CONFIG`).
     tools_config: Option<PathBuf>,
+
+    #[serde(default)]
+    os_map: HashMap<String, Vec<String>>,
+
+    #[serde(default)]
+    arch_map: HashMap<String, Vec<String>>,
+}
+
+fn get_os_list(config: &AppConfig) -> Vec<String> {
+    let os = std::env::consts::OS;
+    if let Some(list) = config.os_map.get(os).filter(|l| !l.is_empty()) {
+        return list.clone();
+    }
+    let defaults = match os {
+        "macos" => &["darwin", "macos", "osx", "apple-darwin"][..],
+        "windows" => &["windows", "win", "win64", "pc-windows-msvc"],
+        "linux" => &["linux", "linux-gnu", "unknown-linux-gnu"],
+        other => &[other],
+    };
+    defaults.iter().map(|&s| s.to_string()).collect()
+}
+
+fn get_arch_list(config: &AppConfig) -> Vec<String> {
+    let arch = std::env::consts::ARCH;
+    if let Some(list) = config.arch_map.get(arch).filter(|l| !l.is_empty()) {
+        return list.clone();
+    }
+    let defaults = match arch {
+        "x86_64" => &["amd64", "x86_64", "x64", "64bit"][..],
+        "aarch64" => &["arm64", "aarch64"],
+        "i386" => &["386", "i386", "x86", "32bit"],
+        other => &[other],
+    };
+    defaults.iter().map(|&s| s.to_string()).collect()
 }
 
 /// Load `clipdate.toml` from `override_path` if given, otherwise look for one
@@ -801,14 +909,12 @@ fn load_app_config(override_path: Option<&Path>) -> Result<AppConfig> {
 /// This is called once right after `Cli::parse()`. Because clap already folds
 /// environment variables into `cli.*`, the effective priority is:
 /// CLI flag > env var > clipdate.toml > built-in default.
-fn apply_settings_to_cli(cli: &mut Cli) -> Result<()> {
-    let cfg = load_app_config(cli.settings.as_deref())?;
-
+fn apply_settings_to_cli(cli: &mut Cli, cfg: &AppConfig) -> Result<()> {
     if cli.install_dir.is_none() {
-        cli.install_dir = cfg.install_dir;
+        cli.install_dir = cfg.install_dir.clone();
     }
     if cli.token.is_none() {
-        cli.token = cfg.token;
+        cli.token = cfg.token.clone();
     }
     // `no_unicode` is a bool flag; the config can only force it on.
     // It cannot suppress the runtime supports_unicode check.
@@ -816,7 +922,7 @@ fn apply_settings_to_cli(cli: &mut Cli) -> Result<()> {
         cli.no_unicode = cfg.no_unicode.unwrap_or(false);
     }
     if cli.config.is_none() {
-        cli.config = cfg.tools_config;
+        cli.config = cfg.tools_config.clone();
     }
 
     Ok(())
@@ -824,14 +930,41 @@ fn apply_settings_to_cli(cli: &mut Cli) -> Result<()> {
 
 fn main() -> Result<()> {
     let mut cli = Cli::parse();
-    apply_settings_to_cli(&mut cli)?;
+    let app_config = load_app_config(cli.settings.as_deref())?;
+    apply_settings_to_cli(&mut cli, &app_config)?;
+
+    // ── Subcommand Dispatch ──────────────────────────────────────────────────
+    if let Some(ref command) = cli.command {
+        match command {
+            Commands::Add {
+                repo,
+                name,
+                exe,
+                asset,
+                yes,
+            } => {
+                return handle_add_command(
+                    &cli,
+                    &app_config,
+                    repo,
+                    name.clone(),
+                    exe.clone(),
+                    asset.clone(),
+                    *yes,
+                );
+            }
+        }
+    }
 
     // ── Load config ──────────────────────────────────────────────────────────
-    let config_path = cli.config.unwrap_or_else(default_config_path);
-    let config_str = fs::read_to_string(&config_path)
-        .with_context(|| format!("reading config: {}", config_path.display()))?;
-    let all_tools: Vec<ToolDef> =
-        serde_json::from_str(&config_str).with_context(|| "parsing tools.json")?;
+    let config_path = cli.config.clone().unwrap_or_else(default_config_path);
+    let all_tools: Vec<ToolDef> = if cli.config.is_some() || config_path.exists() {
+        let config_str = fs::read_to_string(&config_path)
+            .with_context(|| format!("reading config: {}", config_path.display()))?;
+        serde_json::from_str(&config_str).with_context(|| "parsing tools.json")?
+    } else {
+        Vec::new()
+    };
 
     // ── Filter tools ─────────────────────────────────────────────────────────
     let tools: Vec<&ToolDef> = if cli.tools.is_empty() {
@@ -853,6 +986,11 @@ fn main() -> Result<()> {
         }
         filtered
     };
+
+    if tools.is_empty() && !cli.self_update {
+        println!("No tools configured. Use `clipdate add <repo>` to add a tool.");
+        return Ok(());
+    }
 
     let install_dir = cli.install_dir.unwrap_or_else(default_install_dir);
     fs::create_dir_all(&install_dir)
@@ -881,6 +1019,7 @@ fn main() -> Result<()> {
         dry_run: cli.dry_run,
         force: cli.force,
         glyphs: &glyphs,
+        app_config: &app_config,
     };
 
     if cli.self_update {
@@ -912,6 +1051,200 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn detect_asset_template(
+    assets: &[GhAsset],
+    latest_str: &str,
+    name: &str,
+    os_list: &[String],
+    arch_list: &[String],
+) -> Option<(String, Option<String>)> {
+    // First try to match both OS and arch; fall back to OS-only.
+    let (asset_name, matched_os, matched_arch) = assets
+        .iter()
+        .find_map(|asset| {
+            let os = os_list.iter().find(|os| name_has_token(&asset.name, os))?;
+            let arch = arch_list.iter().find(|a| name_has_token(&asset.name, a))?;
+            Some((&asset.name, Some(os.clone()), Some(arch.clone())))
+        })
+        .or_else(|| {
+            assets.iter().find_map(|asset| {
+                let os = os_list.iter().find(|os| name_has_token(&asset.name, os))?;
+                Some((&asset.name, Some(os.clone()), None::<String>))
+            })
+        })?;
+
+    let mut template = asset_name.clone();
+
+    let v_with_prefix = format!("v{}", latest_str);
+    if template.contains(&v_with_prefix) {
+        template = template.replace(&v_with_prefix, "v{VERSION}");
+    } else if template.contains(latest_str) {
+        template = template.replace(latest_str, "{VERSION}");
+    }
+
+    if let Some((os, idx)) = matched_os.as_ref().and_then(|os| {
+        template
+            .to_lowercase()
+            .find(&os.to_lowercase())
+            .map(|i| (os, i))
+    }) {
+        template.replace_range(idx..idx + os.len(), "{OS}");
+    }
+
+    if let Some((arch, idx)) = matched_arch.as_ref().and_then(|arch| {
+        template
+            .to_lowercase()
+            .find(&arch.to_lowercase())
+            .map(|i| (arch, i))
+    }) {
+        template.replace_range(idx..idx + arch.len(), "{ARCH}");
+    }
+
+    let mut is_archive = false;
+    for ext in &[".zip", ".tar.gz", ".tgz"] {
+        if template.to_lowercase().ends_with(ext) {
+            is_archive = true;
+            let idx = template.len() - ext.len();
+            template.replace_range(idx.., ".{EXT}");
+            break;
+        }
+    }
+
+    let archive_entry = if is_archive {
+        Some(name.to_string())
+    } else {
+        if template.to_lowercase().ends_with(".exe") {
+            let idx = template.len() - 4;
+            template.replace_range(idx.., "{EXE}");
+        }
+        None
+    };
+
+    Some((template, archive_entry))
+}
+
+/// Serialize to JSON, but with a few cleanups.
+fn to_clean_json<T: Serialize>(data: &T) -> Result<String, serde_json::Error> {
+    let pretty = serde_json::to_string_pretty(data)?;
+    // this cleans up extra newlines and spaces in arrays, hopefully safely...
+    let re_array = Regex::new(r"\[([^\{\}]*?)\]").unwrap();
+    let re_spaces = Regex::new(r"\s+").unwrap();
+    let clean = re_array.replace_all(&pretty, |caps: &regex::Captures| {
+        let content = re_spaces.replace_all(&caps[1], " ");
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("[{}]", trimmed)
+        }
+    });
+    Ok(clean.into_owned())
+}
+
+fn handle_add_command(
+    cli: &Cli,
+    app_config: &AppConfig,
+    repo: &str,
+    name_opt: Option<String>,
+    exe_opt: Option<String>,
+    asset_opt: Option<String>,
+    yes: bool,
+) -> Result<()> {
+    let name = name_opt.unwrap_or_else(|| {
+        repo.split('/')
+            .next_back()
+            .unwrap_or(repo)
+            .trim_start_matches("cli-")
+            .trim_end_matches("-cli")
+            .to_string()
+    });
+
+    println!("Adding tool '{}' from repo '{}'...", name, repo);
+
+    let client = build_client(cli.token.as_deref())?;
+    let (latest_str, assets) = fetch_latest_version(&client, repo)?;
+
+    println!("Latest version found: {}", latest_str);
+
+    let os_list = get_os_list(app_config);
+    let arch_list = get_arch_list(app_config);
+
+    let (asset_template, archive_entry_template) = if let Some(asset) = asset_opt {
+        let is_archive = asset.contains("{EXT}");
+        let entry = if is_archive { Some(name.clone()) } else { None };
+        (asset, entry)
+    } else {
+        detect_asset_template(&assets, &latest_str, &name, &os_list, &arch_list)
+            .ok_or_else(|| anyhow!("Could not auto-detect asset template from release assets. Please specify it manually with --asset."))?
+    };
+
+    let exe_name = exe_opt.unwrap_or_else(|| name.clone());
+
+    let new_tool = ToolDef {
+        name: name.clone(),
+        exe_name,
+        version_args: vec!["--version".to_string()],
+        version_regex: r"(\d+\.\d+\.\d+)".to_string(),
+        repo: repo.to_string(),
+        asset_template,
+        archive_entry_template,
+    };
+
+    println!("\nProposed tool definition:");
+    println!("{}", to_clean_json(&new_tool)?);
+
+    let config_path = cli.config.clone().unwrap_or_else(default_config_path);
+    let mut all_tools: Vec<ToolDef> = if config_path.exists() {
+        let config_str = fs::read_to_string(&config_path)?;
+        serde_json::from_str(&config_str).context("parsing existing tools.json")?
+    } else {
+        Vec::new()
+    };
+
+    if all_tools
+        .iter()
+        .any(|t| t.name.eq_ignore_ascii_case(&new_tool.name))
+    {
+        bail!("Tool '{}' already exists in tools.json.", new_tool.name);
+    }
+
+    let mut proceed = yes;
+    if !proceed && console::user_attended() {
+        print!(
+            "\nDo you want to add this tool to {}? [y/N]: ",
+            config_path.display()
+        );
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_ok() {
+            let input = input.trim().to_lowercase();
+            if input == "y" || input == "yes" {
+                proceed = true;
+            }
+        }
+    } else if !proceed {
+        proceed = true;
+    }
+
+    if proceed {
+        all_tools.push(new_tool);
+        if let Some(parent) = config_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json_str = to_clean_json(&all_tools)?;
+        fs::write(&config_path, json_str)?;
+        println!(
+            "Successfully added '{}' to {}.",
+            name,
+            config_path.display()
+        );
+    } else {
+        println!("Cancelled.");
+    }
+
+    Ok(())
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -920,10 +1253,15 @@ mod tests {
 
     #[test]
     fn test_expand_template() {
-        // We can't strictly assert OS/ARCH because they vary by the machine running the test,
-        // but we can assert {VERSION} and that the placeholders are no longer present.
-        let expanded = expand_template("test_{VERSION}_{OS}_{ARCH}_{EXE}_{EXT}", "1.2.3");
+        let expanded = expand_template_with_os_arch(
+            "test_{VERSION}_{OS}_{ARCH}_{EXE}_{EXT}",
+            "1.2.3",
+            "macos",
+            "amd64",
+        );
         assert!(expanded.contains("1.2.3"));
+        assert!(expanded.contains("macos"));
+        assert!(expanded.contains("amd64"));
         assert!(!expanded.contains("{VERSION}"));
         assert!(!expanded.contains("{OS}"));
         assert!(!expanded.contains("{ARCH}"));
@@ -1029,6 +1367,8 @@ mod tests {
             token: Some("config_token".to_string()),
             no_unicode: Some(true),
             tools_config: Some(PathBuf::from("/from/config/tools.json")),
+            os_map: HashMap::new(),
+            arch_map: HashMap::new(),
         };
 
         let mut cli = Cli {
@@ -1041,21 +1381,11 @@ mod tests {
             self_update: false,
             no_unicode: false, // CLI left it false; config says true
             settings: None,
+            command: None,
         };
 
-        // Manually apply (mirrors apply_settings_to_cli without the file I/O).
-        if cli.install_dir.is_none() {
-            cli.install_dir = cfg.install_dir;
-        }
-        if cli.token.is_none() {
-            cli.token = cfg.token;
-        }
-        if !cli.no_unicode {
-            cli.no_unicode = cfg.no_unicode.unwrap_or(false);
-        }
-        if cli.config.is_none() {
-            cli.config = cfg.tools_config;
-        }
+        // Call apply_settings_to_cli directly.
+        apply_settings_to_cli(&mut cli, &cfg).unwrap();
 
         // CLI values should be preserved.
         assert_eq!(
@@ -1069,5 +1399,53 @@ mod tests {
         );
         // no_unicode was false on CLI, config had true → config wins here (expected).
         assert!(cli.no_unicode);
+    }
+
+    #[test]
+    fn test_expand_exe_template() {
+        let expanded = expand_exe_template("foo", "", "windows", "amd64");
+        if cfg!(windows) {
+            assert_eq!(expanded, "foo.exe");
+        } else {
+            assert_eq!(expanded, "foo");
+        }
+
+        let expanded_explicit = expand_exe_template("foo{EXE}", "", "windows", "amd64");
+        if cfg!(windows) {
+            assert_eq!(expanded_explicit, "foo.exe");
+        } else {
+            assert_eq!(expanded_explicit, "foo");
+        }
+    }
+
+    #[test]
+    fn test_detect_asset_template() {
+        let assets = vec![
+            GhAsset {
+                name: "koyeb-cli_2.0.0_windows_amd64.zip".to_string(),
+                browser_download_url: "url1".to_string(),
+            },
+            GhAsset {
+                name: "koyeb-cli_2.0.0_darwin_amd64.tar.gz".to_string(),
+                browser_download_url: "url2".to_string(),
+            },
+        ];
+        let os_list = vec!["windows".to_string(), "win".to_string()];
+        let arch_list = vec!["amd64".to_string(), "x86_64".to_string()];
+
+        let (template, entry) =
+            detect_asset_template(&assets, "2.0.0", "koyeb", &os_list, &arch_list).unwrap();
+        assert_eq!(template, "koyeb-cli_{VERSION}_{OS}_{ARCH}.{EXT}");
+        assert_eq!(entry, Some("koyeb".to_string()));
+
+        let assets_direct = vec![GhAsset {
+            name: "opera-proxy.windows-amd64.exe".to_string(),
+            browser_download_url: "url3".to_string(),
+        }];
+        let (template_direct, entry_direct) =
+            detect_asset_template(&assets_direct, "1.0.0", "opera-proxy", &os_list, &arch_list)
+                .unwrap();
+        assert_eq!(template_direct, "opera-proxy.{OS}-{ARCH}{EXE}");
+        assert_eq!(entry_direct, None);
     }
 }
