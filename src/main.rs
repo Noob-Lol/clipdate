@@ -92,6 +92,17 @@ fn get_archive_ext() -> &'static str {
     if cfg!(windows) { "zip" } else { "tar.gz" }
 }
 
+/// Returns `true` if `token` appears as a whole word inside `name`, where words
+/// are delimited by `-`, `_`, `.`, or the string boundaries.
+/// This prevents "win" from matching inside "darwin" (dar**win**).
+fn name_has_token(name: &str, token: &str) -> bool {
+    let name_lc = name.to_lowercase();
+    let token_lc = token.to_lowercase();
+    name_lc
+        .split(['-', '_', '.'])
+        .any(|part| part == token_lc)
+}
+
 fn expand_template_with_os_arch(template: &str, version: &str, os: &str, arch: &str) -> String {
     template
         .replace("{VERSION}", version)
@@ -1051,21 +1062,13 @@ fn detect_asset_template(
     let (asset_name, matched_os, matched_arch) = assets
         .iter()
         .find_map(|asset| {
-            let lower = asset.name.to_lowercase();
-            let os = os_list
-                .iter()
-                .find(|os| lower.contains(&os.to_lowercase()))?;
-            let arch = arch_list
-                .iter()
-                .find(|a| lower.contains(&a.to_lowercase()))?;
+            let os = os_list.iter().find(|os| name_has_token(&asset.name, os))?;
+            let arch = arch_list.iter().find(|a| name_has_token(&asset.name, a))?;
             Some((&asset.name, Some(os.clone()), Some(arch.clone())))
         })
         .or_else(|| {
             assets.iter().find_map(|asset| {
-                let lower = asset.name.to_lowercase();
-                let os = os_list
-                    .iter()
-                    .find(|os| lower.contains(&os.to_lowercase()))?;
+                let os = os_list.iter().find(|os| name_has_token(&asset.name, os))?;
                 Some((&asset.name, Some(os.clone()), None::<String>))
             })
         })?;
