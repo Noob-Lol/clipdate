@@ -1120,6 +1120,24 @@ fn detect_asset_template(
     Some((template, archive_entry))
 }
 
+/// Serialize to JSON, but with a few cleanups.
+fn to_clean_json<T: Serialize>(data: &T) -> Result<String, serde_json::Error> {
+    let pretty = serde_json::to_string_pretty(data)?;
+    // this cleans up extra newlines and spaces in arrays, hopefully safely...
+    let re_array = Regex::new(r"\[([^\{\}]*?)\]").unwrap();
+    let re_spaces = Regex::new(r"\s+").unwrap();
+    let clean = re_array.replace_all(&pretty, |caps: &regex::Captures| {
+        let content = re_spaces.replace_all(&caps[1], " ");
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("[{}]", trimmed)
+        }
+    });
+    Ok(clean.into_owned())
+}
+
 fn handle_add_command(
     cli: &Cli,
     app_config: &AppConfig,
@@ -1170,7 +1188,7 @@ fn handle_add_command(
     };
 
     println!("\nProposed tool definition:");
-    println!("{}", serde_json::to_string_pretty(&new_tool)?);
+    println!("{}", to_clean_json(&new_tool)?);
 
     let config_path = cli.config.clone().unwrap_or_else(default_config_path);
     let mut all_tools: Vec<ToolDef> = if config_path.exists() {
@@ -1210,7 +1228,7 @@ fn handle_add_command(
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let json_str = serde_json::to_string_pretty(&all_tools)?;
+        let json_str = to_clean_json(&all_tools)?;
         fs::write(&config_path, json_str)?;
         println!(
             "Successfully added '{}' to {}.",
