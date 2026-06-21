@@ -67,7 +67,7 @@ jobs:
             archive_ext: zip
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Verify Cargo.toml version matches tag
         if: github.event_name == 'push'
